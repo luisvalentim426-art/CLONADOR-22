@@ -24,12 +24,12 @@ args = "Start application"
 name = "Start application"
 author = "agent"
 
+[workflows.workflow.metadata]
+outputType = "console"
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "npx ts-node --project tsconfig.run.json index.ts"
-
-[workflows.workflow.metadata]
-outputType = "console"
 
 [agent]
 stack = "PNPM_WORKSPACE"
