@@ -273,109 +273,126 @@ async function scrapeKeyword(keyword: string, country: string, context: BrowserC
   try {
     await sendToTelegram(`🔎 <b>PESQUISANDO:</b> ${keyword} — ${countryName}`);
     await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await delay(5000);
-    await page.evaluate(() => window.scrollBy(0, 1500));
-    await delay(2000);
+    await delay(4000);
+    await page.evaluate(() => window.scrollBy(0, 800));
+    await delay(3000);
 
     const libScreenshot = `lib_${Date.now()}.png`;
     await page.screenshot({ path: libScreenshot });
     await sendPhoto(libScreenshot, `🔍 ${keyword} — ${countryName}`);
 
-    // Extract ads by finding elements with 'Patrocinado'/'Sponsored' text,
-    // then walking up the DOM to get the real ad card container.
-    const ads = await page.evaluate(() => {
-      const isFbLink = (h: string) =>
-        !h || h.includes('facebook.com') || h.includes('fb.com') || h.includes('fb.me') || !h.startsWith('http');
+    // Use Playwright's exact text locator to find "Patrocinado" labels inside actual ad cards
+    const sponsoredLocator = page.getByText('Patrocinado', { exact: true });
+    let count = 0;
+    try {
+      await sponsoredLocator.first().waitFor({ timeout: 12000 });
+      count = Math.min(await sponsoredLocator.count(), MAX_ADS_PER_KEYWORD);
+    } catch {
+      const engLocator = page.getByText('Sponsored', { exact: true });
+      try {
+        await engLocator.first().waitFor({ timeout: 5000 });
+        count = Math.min(await engLocator.count(), MAX_ADS_PER_KEYWORD);
+      } catch { /* no ads */ }
+    }
 
-      // Find all leaf-level text nodes that say 'Patrocinado' or 'Sponsored'
-      const sponsoredEls = Array.from(document.querySelectorAll('*')).filter(el => {
-        const t = el.textContent?.trim();
-        return (t === 'Patrocinado' || t === 'Sponsored') && el.children.length === 0;
-      });
-
-      return sponsoredEls.slice(0, 10).map(sponsoredEl => {
-        // Walk up the DOM until we find a card-level container with meaningful content
-        let card: Element | null = sponsoredEl;
-        for (let i = 0; i < 8; i++) {
-          if (!card?.parentElement) break;
-          card = card.parentElement;
-          const h = (card as HTMLElement).innerText || '';
-          // Stop when card has enough content to be a full ad card
-          if (h.length > 100) break;
-        }
-        if (!card) return null;
-
-        const cardEl = card as HTMLElement;
-        const text = cardEl.innerText || '';
-
-        // Skip if this looks like navigation/header content
-        if (
-          text.includes('Biblioteca de Anúncios da Meta') ||
-          text.includes('Relatório da Biblioteca') ||
-          text.length < 30
-        ) return null;
-
-        const images = Array.from(cardEl.querySelectorAll('img'))
-          .map((img: any) => img.src as string)
-          .filter((src: string) => src && src.startsWith('http') && !src.includes('emoji') && !src.includes('static'));
-
-        const videos = Array.from(cardEl.querySelectorAll('video'))
-          .map((v: any) => v.src as string)
-          .filter(Boolean);
-
-        // Advertiser: first meaningful link text near the top of the card
-        const advertiserEl = cardEl.querySelector('a[role="link"]') as HTMLElement | null;
-        const advertiser = advertiserEl?.innerText?.trim() || 'Desconhecido';
-
-        // CTA links — button/link text containing known CTA words, filtered to external URLs only
-        const ctaKeywords = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'continuar', 'começar', 'ver mais', 'obter'];
-        const ctaLinks = Array.from(cardEl.querySelectorAll('a, button'))
-          .filter((el: any) => {
-            const t = (el.innerText || '').toLowerCase();
-            return ctaKeywords.some(k => t.includes(k));
-          })
-          .map((el: any) => el.href as string || null)
-          .filter((h: string | null): h is string => !!h && !isFbLink(h));
-
-        // All external links in the card (non-facebook)
-        const allLinks = Array.from(cardEl.querySelectorAll('a'))
-          .map((a: any) => a.href as string)
-          .filter((h: string) => !isFbLink(h));
-
-        // WhatsApp links
-        const waLinks = Array.from(cardEl.querySelectorAll('a'))
-          .map((a: any) => a.href as string)
-          .filter((h: string) => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
-
-        const dateMatch = text.match(/(\d+)\s*de\s*(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/i);
-
-        return {
-          text: text.substring(0, 1000),
-          images: images.slice(0, 2),
-          videos: videos.slice(0, 1),
-          hasVideo: videos.length > 0,
-          advertiser,
-          dateText: dateMatch ? dateMatch[0] : null,
-          ctaLinks: ctaLinks.slice(0, 3),
-          links: allLinks.slice(0, 3),
-          waLinks: waLinks.slice(0, 2),
-        };
-      }).filter(Boolean);
-    });
-
-    if (!ads || ads.length === 0) {
+    if (count === 0) {
       await sendToTelegram(`⚠️ Nenhum anúncio para <b>${keyword}</b> em ${countryName}`);
       return;
     }
 
-    await sendToTelegram(`✅ <b>${ads.length} anúncios encontrados</b>`);
+    await sendToTelegram(`✅ <b>${count} anúncios encontrados</b>`);
 
-    for (let i = 0; i < ads.length; i++) {
-      await processAd(context, ads[i], i, keyword, country, categoryScores);
-      await delay(3000);
+    for (let i = 0; i < count; i++) {
+      try {
+        const sponsoredEl = sponsoredLocator.nth(i);
+
+        // XPath: find the closest ancestor div that has an a[role="link"] inside it
+        // That link is always the advertiser name — uniquely scoped to each ad card
+        const cardLocator = sponsoredEl.locator('xpath=ancestor::div[.//a[@role="link"]][1]');
+
+        const adData = await cardLocator.evaluate((cardEl: HTMLElement) => {
+          // Decode Facebook redirect URLs: l.facebook.com/l.php?u=REAL_URL
+          function extractRealUrl(href: string): string | null {
+            if (!href) return null;
+            if (href.includes('l.facebook.com/l.php') || href.includes('lm.facebook.com')) {
+              try {
+                const u = new URL(href).searchParams.get('u');
+                if (u) return decodeURIComponent(u);
+              } catch {}
+              return null;
+            }
+            if (
+              href.startsWith('http') &&
+              !href.includes('facebook.com') &&
+              !href.includes('fb.com') &&
+              !href.includes('fb.me') &&
+              !href.includes('instagram.com')
+            ) return href;
+            return null;
+          }
+
+          const text = cardEl.innerText || '';
+
+          const images = Array.from(cardEl.querySelectorAll('img'))
+            .map((img: any) => img.src as string)
+            .filter((src: string) => src && src.startsWith('https://') && src.includes('fbcdn') && !src.includes('emoji'));
+
+          const videos = Array.from(cardEl.querySelectorAll('video'))
+            .map((v: any) => v.src as string)
+            .filter(Boolean);
+
+          const advertiserEl = cardEl.querySelector('a[role="link"]') as HTMLElement | null;
+          const advertiser = advertiserEl?.innerText?.trim() || 'Desconhecido';
+
+          const ctaKeywords = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'continuar', 'começar', 'ver mais', 'obter', 'inscrever', 'assinar'];
+
+          const ctaLinks = Array.from(cardEl.querySelectorAll('a'))
+            .filter((a: any) => {
+              const t = (a.innerText || '').toLowerCase();
+              return ctaKeywords.some(k => t.includes(k));
+            })
+            .map((a: any) => extractRealUrl(a.href))
+            .filter((h: string | null): h is string => h !== null);
+
+          const allLinks = Array.from(cardEl.querySelectorAll('a'))
+            .map((a: any) => extractRealUrl(a.href))
+            .filter((h: string | null): h is string => h !== null);
+
+          const waLinks = Array.from(cardEl.querySelectorAll('a'))
+            .map((a: any) => a.href as string)
+            .filter((h: string) => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
+
+          const dateMatch = text.match(/(\d+)\s*de\s*(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/i);
+
+          return {
+            text: text.substring(0, 1000),
+            images: images.slice(0, 2),
+            videos: videos.slice(0, 1),
+            hasVideo: videos.length > 0,
+            advertiser,
+            dateText: dateMatch ? dateMatch[0] : null,
+            ctaLinks: ctaLinks.slice(0, 3),
+            links: allLinks.slice(0, 3),
+            waLinks: waLinks.slice(0, 2),
+          };
+        });
+
+        // Skip nav/header content
+        if (
+          adData.text.includes('Biblioteca de Anúncios da Meta') ||
+          adData.text.includes('Relatório da Biblioteca') ||
+          adData.text.includes('Sobre a Biblioteca') ||
+          adData.text.length < 30
+        ) continue;
+
+        await processAd(context, adData, i, keyword, country, categoryScores);
+        await delay(3000);
+      } catch (err) {
+        console.error(`Erro ao processar anúncio ${i}:`, err);
+      }
     }
 
-    await sendToTelegram(`✅ <b>CONCLUÍDO:</b> ${keyword} — ${ads.length} anúncios analisados`);
+    await sendToTelegram(`✅ <b>CONCLUÍDO:</b> ${keyword} — ${count} anúncios analisados`);
 
   } catch (err) {
     console.error(`Erro keyword "${keyword}":`, err);
