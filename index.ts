@@ -3,6 +3,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import * as fs from 'fs';
 import * as https from 'https';
 import * as http from 'http';
+import * as path from 'path';
 import * as dotenv from 'dotenv';
 
 dotenv.config();
@@ -10,7 +11,17 @@ dotenv.config();
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN!, { polling: false });
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 
-const KEYWORD_CATEGORIES: { [key: string]: string[] } = {
+// ─── Config ───────────────────────────────────────────────────────────────────
+const MAX_ADS_COLLECT    = 15;   // how many cards to read per keyword
+const MAX_ADS_SEND       = 10;   // top N to send after ranking
+const KEYWORD_GAP_MS     = 15 * 60 * 1000;   // 15 min between keywords
+const CYCLE_SLEEP_MS     = 22 * 60 * 60 * 1000; // 22 h between full cycles
+const HISTORY_FILE       = 'history.json';
+const HISTORY_TTL_MS     = 23 * 60 * 60 * 1000; // skip re-analysis within 23 h
+const MIN_VIDEO_BYTES    = 50_000;  // reject video files smaller than this
+const MIN_IMAGE_BYTES    = 5_000;   // reject image files smaller than this
+
+const KEYWORD_CATEGORIES: Record<string, string[]> = {
   'PDF':       ['PDF por apenas 9,99', 'PDF por apenas 10', 'PDF por apenas 17', 'PDF por apenas 27', 'PDF por apenas 37', 'PDF por apenas 47'],
   'Receitas':  ['Receitas por apenas 9,99', 'Receitas por apenas 10', 'Receitas por apenas 17', 'Receitas por apenas 27', 'Receitas por apenas 37'],
   'Planner':   ['Planner por apenas 9,99', 'Planner por apenas 10', 'Planner por apenas 17', 'Planner por apenas 27', 'Planner por apenas 37'],
@@ -25,8 +36,6 @@ const KEYWORD_CATEGORIES: { [key: string]: string[] } = {
 };
 
 const COUNTRIES = ['BR', 'MZ'];
-const MAX_ADS_PER_KEYWORD = 10;   // max ads to collect per keyword
-const MAX_SEND_PER_KEYWORD = 10;  // max to send after ranking
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -34,8 +43,9 @@ interface ScoredAd {
   advertiser: string;
   keyword: string;
   country: string;
-  score: number;                // 1–10
+  score: number;
   price: string;
+  priceNum: number | null;
   creativeType: string;
   dateText: string | null;
   hasVSL: boolean;
@@ -49,64 +59,143 @@ interface ScoredAd {
   domains: string[];
   platform: string;
   funnelUrl: string;
+  landingDomain: string;
   cleanCopy: string;
   creativePath: string | null;
   creativeIsVideo: boolean;
   funnelStepData: any[];
+  offerAnalysis: OfferAnalysis;
+  similarCount: number;
+}
+
+interface OfferAnalysis {
+  product: string;
+  mainPromise: string;
+  hasBonus: boolean;
+  hasUrgency: boolean;
+  hasRecurring: boolean;
+  hasGuarantee: boolean;
+  ctaStrength: 'fraco' | 'médio' | 'forte';
+}
+
+// ─── History (memory between runs) ───────────────────────────────────────────
+
+type HistoryEntry = { lastSeen: number; score: number; advertiser: string };
+type History = Record<string, HistoryEntry>;
+
+function loadHistory(): History {
+  try {
+    if (fs.existsSync(HISTORY_FILE)) return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+  } catch {}
+  return {};
+}
+
+function saveHistory(h: History) {
+  try { fs.writeFileSync(HISTORY_FILE, JSON.stringify(h, null, 2)); } catch {}
+}
+
+function wasRecentlyAnalyzed(h: History, key: string): boolean {
+  const e = h[key];
+  return !!e && (Date.now() - e.lastSeen) < HISTORY_TTL_MS;
+}
+
+function markAnalyzed(h: History, key: string, score: number, advertiser: string) {
+  h[key] = { lastSeen: Date.now(), score, advertiser };
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
-function delay(ms: number) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+function delay(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
 async function sendToTelegram(message: string) {
   try {
-    await bot.sendMessage(CHAT_ID, message, { parse_mode: 'HTML', disable_web_page_preview: true });
-  } catch (err) {
-    console.error('Telegram send error:', err);
-  }
+    await bot.sendMessage(CHAT_ID, message.substring(0, 4096), { parse_mode: 'HTML', disable_web_page_preview: true });
+  } catch (err) { console.error('TG msg error:', err); }
 }
 
 async function sendPhoto(filePath: string, caption: string) {
   try {
     if (!fs.existsSync(filePath)) return;
-    await bot.sendPhoto(CHAT_ID, filePath, { caption: caption.substring(0, 1024) });
+    const stat = fs.statSync(filePath);
+    if (stat.size < MIN_IMAGE_BYTES) { fs.unlinkSync(filePath); return; }
+    try {
+      await bot.sendPhoto(CHAT_ID, filePath, { caption: caption.substring(0, 1024) });
+    } catch (photoErr: any) {
+      // Fallback to document if image dimensions exceed Telegram limits
+      const errStr = String(photoErr?.message || photoErr || '');
+      const isPhotoErr = errStr.includes('PHOTO_INVALID') || errStr.includes('PHOTO_SAVE') || errStr.includes('400');
+      if (isPhotoErr) {
+        try { await bot.sendDocument(CHAT_ID, filePath, { caption: caption.substring(0, 1024) }); }
+        catch { /* silently skip if document also fails */ }
+      } else { throw photoErr; }
+    }
     fs.unlinkSync(filePath);
-  } catch (err) {
-    console.error('Photo error:', err);
-  }
+  } catch (err) { console.error('Photo error:', err); safeDelete(filePath); }
+}
+
+async function sendScreenshot(filePath: string, caption: string) {
+  // Screenshots are always sent as documents — no Telegram dimension limits
+  try {
+    if (!fs.existsSync(filePath)) return;
+    const stat = fs.statSync(filePath);
+    if (stat.size < MIN_IMAGE_BYTES) { fs.unlinkSync(filePath); return; }
+    await bot.sendDocument(CHAT_ID, filePath, { caption: caption.substring(0, 1024) });
+    fs.unlinkSync(filePath);
+  } catch (err) { console.error('Screenshot error:', err); safeDelete(filePath); }
 }
 
 async function sendVideo(filePath: string, caption: string) {
   try {
     if (!fs.existsSync(filePath)) return;
+    const stat = fs.statSync(filePath);
+    if (stat.size < MIN_VIDEO_BYTES) { fs.unlinkSync(filePath); return; }
     await bot.sendVideo(CHAT_ID, filePath, { caption: caption.substring(0, 1024) });
     fs.unlinkSync(filePath);
-  } catch (err) {
-    console.error('Video error:', err);
-  }
+  } catch (err) { console.error('Video error:', err); safeDelete(filePath); }
 }
 
-function downloadFile(url: string, dest: string): Promise<boolean> {
+function safeDelete(filePath: string) {
+  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+}
+
+// Download with redirect following + headers + size validation
+function downloadFile(url: string, dest: string, minBytes = 0, depth = 0): Promise<boolean> {
+  if (depth > 5) return Promise.resolve(false);
   return new Promise((resolve) => {
     const file = fs.createWriteStream(dest);
     const protocol = url.startsWith('https') ? https : http;
-    const req = protocol.get(url, (response) => {
-      if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        file.close();
-        fs.unlink(dest, () => {});
-        downloadFile(response.headers.location!, dest).then(resolve);
+    const options = {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.facebook.com/',
+        'Accept': '*/*',
+      }
+    };
+    const req = protocol.get(url, options, (res) => {
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        file.close(); fs.unlink(dest, () => {});
+        downloadFile(res.headers.location!, dest, minBytes, depth + 1).then(resolve);
         return;
       }
-      response.pipe(file);
-      file.on('finish', () => { file.close(); resolve(true); });
+      if (res.statusCode && res.statusCode !== 200) {
+        file.close(); fs.unlink(dest, () => {}); resolve(false); return;
+      }
+      res.pipe(file);
+      file.on('finish', () => {
+        file.close();
+        try {
+          const size = fs.statSync(dest).size;
+          if (minBytes > 0 && size < minBytes) { fs.unlinkSync(dest); resolve(false); }
+          else resolve(true);
+        } catch { resolve(false); }
+      });
     });
     req.on('error', () => { fs.unlink(dest, () => {}); resolve(false); });
-    req.setTimeout(30000, () => { req.destroy(); fs.unlink(dest, () => {}); resolve(false); });
+    req.setTimeout(45000, () => { req.destroy(); fs.unlink(dest, () => {}); resolve(false); });
   });
 }
+
+// ─── Intelligence Functions ───────────────────────────────────────────────────
 
 function extractPrice(text: string): number | null {
   const patterns = [
@@ -115,124 +204,205 @@ function extractPrice(text: string): number | null {
     /apenas\s*R?\$?\s*(\d+[.,]\d{0,2})/gi,
     /(\d+[.,]\d{0,2})\s*reais/gi,
   ];
-  for (const pattern of patterns) {
-    pattern.lastIndex = 0;
-    const match = pattern.exec(text);
-    if (match) {
-      const price = parseFloat(match[1].replace(',', '.'));
-      if (price >= 9.99 && price <= 50) return price;
+  for (const p of patterns) {
+    p.lastIndex = 0;
+    const m = p.exec(text);
+    if (m) {
+      const price = parseFloat(m[1].replace(',', '.'));
+      if (price >= 5 && price <= 200) return price;
     }
   }
   return null;
 }
 
-// ─── Scoring (1–10) ───────────────────────────────────────────────────────────
-
-function calculateScore(data: {
-  hasVSL: boolean;
-  hasQuiz: boolean;
-  hasUpsell: boolean;
-  hasDownsell: boolean;
-  funnelSteps: number;
-  hasCTA: boolean;
-  hasCheckout: boolean;
-  hasLongCopy: boolean;
+function calculateScore(d: {
+  hasVSL: boolean; hasQuiz: boolean; hasUpsell: boolean; hasDownsell: boolean;
+  funnelSteps: number; hasCTA: boolean; hasCheckout: boolean; hasLongCopy: boolean;
 }): number {
-  let score = 0;
-  if (data.hasVSL)                    score += 2;
-  if (data.hasQuiz)                   score += 2;
-  if (data.hasUpsell || data.hasDownsell) score += 2;
-  if (data.funnelSteps > 1)           score += 1;
-  if (data.hasCTA)                    score += 1;
-  if (data.hasCheckout)               score += 1;
-  if (data.hasLongCopy)               score += 1;
-  return Math.max(1, Math.min(score, 10));  // floor 1, ceiling 10
+  let s = 0;
+  if (d.hasVSL)                      s += 2;
+  if (d.hasQuiz)                     s += 2;
+  if (d.hasUpsell || d.hasDownsell)  s += 2;
+  if (d.funnelSteps > 1)             s += 1;
+  if (d.hasCTA)                      s += 1;
+  if (d.hasCheckout)                 s += 1;
+  if (d.hasLongCopy)                 s += 1;
+  return Math.max(1, Math.min(s, 10));
 }
 
-// ─── Platform Detection ───────────────────────────────────────────────────────
-
 function detectPlatform(url: string, text: string): string {
-  const u = url.toLowerCase();
-  const t = text.toLowerCase();
-  if (u.includes('hotmart.com') || u.includes('hotmart.product') || t.includes('hotmart')) return 'Hotmart';
-  if (u.includes('kiwify.com.br') || u.includes('kiwify.app') || t.includes('kiwify'))    return 'Kiwify';
-  if (u.includes('eduzz.com') || u.includes('sun.eduzz') || t.includes('eduzz'))           return 'Eduzz';
-  if (u.includes('monetizze.com.br') || t.includes('monetizze'))                           return 'Monetizze';
-  if (u.includes('pepper.com.br') || t.includes('pepper'))                                 return 'Pepper';
-  if (u.includes('braip.com') || t.includes('braip'))                                       return 'Braip';
-  if (u.includes('wa.me') || u.includes('whatsapp'))                                       return 'WhatsApp';
-  if (u.includes('/checkout') || u.includes('pay.'))                                       return 'Checkout direto';
+  const u = url.toLowerCase(), t = text.toLowerCase();
+  if (u.includes('hotmart') || t.includes('hotmart'))         return 'Hotmart';
+  if (u.includes('kiwify') || t.includes('kiwify'))           return 'Kiwify';
+  if (u.includes('eduzz') || t.includes('eduzz'))             return 'Eduzz';
+  if (u.includes('monetizze') || t.includes('monetizze'))     return 'Monetizze';
+  if (u.includes('pepper.com') || t.includes('pepper'))       return 'Pepper';
+  if (u.includes('braip') || t.includes('braip'))             return 'Braip';
+  if (u.includes('wa.me') || u.includes('whatsapp'))          return 'WhatsApp';
+  if (u.includes('/checkout') || u.includes('pay.'))          return 'Checkout direto';
   return 'Direto';
 }
 
-// ─── Page Classifier ──────────────────────────────────────────────────────────
-
-function classifyPage(text: string, hasVideo: boolean, radioInputs: number): string {
+// FIX: checkout takes strict priority over quiz — payment pages have radio buttons too
+function classifyPage(text: string, hasVideo: boolean, radioInputs: number, url: string): string {
   const lower = text.toLowerCase();
-  if (hasVideo) return 'VSL';
-  if (radioInputs >= 2 || lower.includes('quiz') || lower.includes('próxima pergunta')) return 'QUIZ';
-  if (lower.includes('checkout') || lower.includes('finalizar compra') || lower.includes('dados do cartão')) return 'CHECKOUT';
+  const isCheckoutUrl = url.includes('checkout') || url.includes('pagamento') || url.includes('pay.') || url.includes('/cart');
+  const hasCheckoutSignals = lower.includes('finalizar compra') || lower.includes('dados do cartão') || lower.includes('cartão de crédito') || lower.includes('número do cartão') || lower.includes('cvv') || lower.includes('boleto') || lower.includes('pix') || isCheckoutUrl;
+
+  if (hasCheckoutSignals)  return 'CHECKOUT';                // CHECKOUT wins first
+  if (hasVideo)            return 'VSL';                     // then VSL
   if (lower.includes('upsell') || lower.includes('leve também') || lower.includes('adicione ao pedido')) return 'UPSELL';
-  if (lower.includes('espera') || lower.includes('antes de sair') || lower.includes('última chance')) return 'DOWNSELL';
+  if ((lower.includes('espera') && (lower.includes('sair') || lower.includes('chance'))) || lower.includes('última chance')) return 'DOWNSELL';
+  // Quiz only if NO checkout and has real quiz structure (not just payment radio inputs)
+  const hasQuizContent = lower.includes('quiz') || lower.includes('próxima pergunta') || lower.includes('qual é o seu') || lower.includes('como você se sente');
+  if ((radioInputs >= 2 && hasQuizContent) || (lower.includes('quiz') && !hasCheckoutSignals)) return 'QUIZ';
   if (lower.includes('whatsapp') || lower.includes('wa.me')) return 'WHATSAPP';
   return 'LANDING';
 }
 
-// ─── Copy Cleaner ─────────────────────────────────────────────────────────────
-// Strips advertiser names, numeric IDs, nav noise — returns natural sales copy
+function analyzeOffer(copy: string, funnelText: string): OfferAnalysis {
+  const all = (copy + ' ' + funnelText).toLowerCase();
+
+  const product = (() => {
+    const m = copy.match(/(pdf|planner|apostila|kit|curso|treinamento|receitas|moldes|aulas|pacote|guia|método|programa|mentoria)[^.!?\n]{0,60}/i);
+    return m ? m[0].trim().substring(0, 80) : 'Produto digital';
+  })();
+
+  const mainPromise = (() => {
+    const patterns = [/descubra[^.!?\n]{0,80}/i, /aprenda[^.!?\n]{0,80}/i, /transforme[^.!?\n]{0,80}/i, /conquiste[^.!?\n]{0,80}/i, /emagreça[^.!?\n]{0,80}/i, /ganhe[^.!?\n]{0,80}/i];
+    for (const p of patterns) { const m = copy.match(p); if (m) return m[0].trim(); }
+    const first = copy.split('\n').find(l => l.length > 30);
+    return first ? first.substring(0, 80) : 'Transformação prometida';
+  })();
+
+  const hasBonus     = /bônus|brinde|grátis|presente|extra/i.test(all);
+  const hasUrgency   = /últimas vagas|apenas hoje|acaba em|restam|limitad|promoção termina|corre/i.test(all);
+  const hasRecurring = /mensal|assinatura|plano|por mês|\/mês/i.test(all);
+  const hasGuarantee = /garantia|reembolso|devolvemos|dinheiro de volta/i.test(all);
+
+  const ctaStrong = /clique agora|garantir minha|quero acesso|comprar agora|baixar agora|sim, quero/i.test(all);
+  const ctaMedium = /clique|garantir|acessar|baixar|comprar|quero/i.test(all);
+  const ctaStrength: OfferAnalysis['ctaStrength'] = ctaStrong ? 'forte' : ctaMedium ? 'médio' : 'fraco';
+
+  return { product, mainPromise, hasBonus, hasUrgency, hasRecurring, hasGuarantee, ctaStrength };
+}
+
+function buildCloneReasons(ad: ScoredAd): string {
+  const reasons: string[] = [];
+  if (ad.hasVSL)     reasons.push('🎬 VSL presente — maior tempo de atenção e conversão');
+  if (ad.hasQuiz)    reasons.push('🧩 Quiz flow — qualifica leads antes do checkout');
+  if (ad.hasUpsell)  reasons.push('⬆️ Upsell estruturado — maximiza ticket médio');
+  if (ad.hasCheckout) reasons.push('🛒 Checkout integrado — funil completo');
+  if (ad.hasLongCopy) reasons.push('📝 Copy longa — alto poder persuasivo');
+  if (ad.offerAnalysis.hasBonus) reasons.push('🎁 Bônus presente — aumenta valor percebido');
+  if (ad.offerAnalysis.hasUrgency) reasons.push('⏰ Urgência/escassez — impulsiona decisão');
+  if (ad.offerAnalysis.hasGuarantee) reasons.push('🛡️ Garantia explícita — reduz fricção');
+  if (ad.offerAnalysis.ctaStrength === 'forte') reasons.push('💪 CTA forte — ação direta');
+  if (ad.funnelSteps > 2) reasons.push(`📊 Funil de ${ad.funnelSteps} etapas — alta sofisticação`);
+  return reasons.length > 0 ? reasons.join('\n') : '✅ Melhor score geral na keyword';
+}
 
 function extractSalesCopy(rawText: string, advertiserName?: string): string {
   const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
-
-  const skipPatterns: RegExp[] = [
-    /^\d{5,}$/,                                          // pure numeric IDs (5+ digits)
-    /^[\d\s\-_|•·]{3,}$/,                               // lines of only numbers/symbols
+  const skip: RegExp[] = [
+    /^\d{5,}$/,
+    /^[\d\s\-_|•·]{3,}$/,
     /^(ac|al|am|ap|ba|ce|df|es|go|ma|mg|ms|mt|pa|pb|pe|pi|pr|rj|rn|ro|rr|rs|sc|se|sp|to)$/i,
     /^(home|menu|início|sobre|contato|política|privacidade|termos|copyright|©|\d{4})/i,
     /^(carrinho|minha conta|entrar|sair|cadastro|login|buscar|pesquisar|fechar|voltar)$/i,
-    /^(aceitar|cookies|ok|sim|não|próximo|anterior)$/i,
+    /^(aceitar|cookies|ok|sim|não|próximo|anterior|pular)$/i,
     /^(facebook|instagram|youtube|twitter|tiktok|whatsapp|telegram)$/i,
-    /^patrocinado$/i,
-    /^sponsored$/i,
-    /^ver mais$/i,
-    /^.{1,12}$/,                                         // too short to be copy
-    /^[^a-záàâãéêíóôõúç]*$/,                            // no Portuguese letters at all
-    /página de facebook/i,
-    /biblioteca de anúncios/i,
-    /relatório da biblioteca/i,
+    /^(patrocinado|sponsored|ver mais|see more)$/i,
+    /^.{1,12}$/, /^[^a-záàâãéêíóôõúç]*$/,
+    /biblioteca de anúncios|relatório da biblioteca|página de facebook/i,
+    /cpf|cnpj|cep|\d{3}\.\d{3}\.\d{3}-\d{2}/i,
   ];
-
-  // Also skip the advertiser name line if provided
   if (advertiserName) {
-    const escapedName = advertiserName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    skipPatterns.push(new RegExp(`^${escapedName}$`, 'i'));
+    const esc = advertiserName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    skip.push(new RegExp(`^${esc}$`, 'i'));
   }
-
-  const salesIndicators = [
+  const salesOk = [
     /apenas|por apenas|somente|desconto|oferta|promoção|grátis|bônus|exclusiv/i,
     /aprenda|descubra|transforme|conquiste|garanta|acesse|baixe|receba/i,
     /método|técnica|estratégia|passo a passo|guia|manual|curso|treinamento/i,
     /resultado|comprovado|garantido|testado|funciona|eficaz/i,
     /R\$|\d+\s*(reais|dias|horas|semanas|meses|anos)/i,
     /clique|acesse|compre|inscreva|cadastre|garanta|quero|começar/i,
-    /você|seu|sua|nosso|nossa|aproveite|não perca|última/i,
+    /você|seu|sua|aproveite|não perca|última/i,
   ];
+  const seen = new Set<string>(), out: string[] = [];
+  for (const l of lines) {
+    if (seen.has(l)) continue; seen.add(l);
+    if (skip.some(p => p.test(l))) continue;
+    if (salesOk.some(p => p.test(l)) || l.length > 40) out.push(l);
+  }
+  return out.slice(0, 18).join('\n');
+}
 
-  const seen = new Set<string>();
-  const cleaned: string[] = [];
+// ─── Creative Download (image + video) with validation ───────────────────────
 
-  for (const line of lines) {
-    if (seen.has(line)) continue;
-    seen.add(line);
-    if (skipPatterns.some(p => p.test(line))) continue;
-
-    const hasSalesContent = salesIndicators.some(p => p.test(line));
-    if (hasSalesContent || line.length > 40) {
-      cleaned.push(line);
+async function downloadCreative(rawCard: any): Promise<{ path: string | null; isVideo: boolean }> {
+  // Try video first
+  if (rawCard.videos && rawCard.videos.length > 0) {
+    for (const videoUrl of rawCard.videos) {
+      if (!videoUrl || !videoUrl.startsWith('http')) continue;
+      const p = `creative_${Date.now()}.mp4`;
+      const ok = await downloadFile(videoUrl, p, MIN_VIDEO_BYTES);
+      if (ok) return { path: p, isVideo: true };
     }
   }
 
-  return cleaned.slice(0, 18).join('\n');
+  // Try images — pick the highest resolution from all candidates
+  const candidates: string[] = [
+    ...(rawCard.images || []),
+    ...(rawCard.backgroundImages || []),
+  ].filter((u: string) => u && u.startsWith('http'));
+
+  // Prefer larger images (by URL heuristic: larger w= param)
+  candidates.sort((a: string, b: string) => {
+    const wa = parseInt(new URLSearchParams(a.split('?')[1] || '').get('_nc_ht') || '0');
+    const wb = parseInt(new URLSearchParams(b.split('?')[1] || '').get('_nc_ht') || '0');
+    return wb - wa;
+  });
+
+  for (const imgUrl of candidates) {
+    const ext = imgUrl.includes('.webp') ? 'webp' : imgUrl.includes('.png') ? 'png' : 'jpg';
+    const p = `creative_${Date.now()}.${ext}`;
+    const ok = await downloadFile(imgUrl, p, MIN_IMAGE_BYTES);
+    if (ok) return { path: p, isVideo: false };
+  }
+
+  return { path: null, isVideo: false };
+}
+
+// ─── VSL Video Download with integrity check ──────────────────────────────────
+
+async function downloadVSL(videoSrc: string): Promise<string | null> {
+  if (!videoSrc || !videoSrc.startsWith('http')) return null;
+  // Skip known undownloadable embed platforms
+  const skip = ['youtube.com', 'youtu.be', 'vimeo.com', 'wistia.com', 'pandavideo'];
+  if (skip.some(s => videoSrc.includes(s))) return null;
+
+  const p = `vsl_${Date.now()}.mp4`;
+  const ok = await downloadFile(videoSrc, p, MIN_VIDEO_BYTES);
+  if (!ok) return null;
+
+  // Extra integrity: file must be > 50KB and start with valid bytes
+  try {
+    const buf = Buffer.alloc(12);
+    const fd = fs.openSync(p, 'r');
+    fs.readSync(fd, buf, 0, 12, 0);
+    fs.closeSync(fd);
+    // MP4 ftyp magic or known video headers
+    const isMp4 = buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70; // ftyp
+    const isOther = buf[0] === 0x1a || buf[0] === 0x00; // other containers
+    if (!isMp4 && !isOther) {
+      fs.unlinkSync(p);
+      return null;
+    }
+  } catch { safeDelete(p); return null; }
+
+  return p;
 }
 
 // ─── Funnel Crawler ───────────────────────────────────────────────────────────
@@ -253,17 +423,16 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
       await delay(2500);
 
       const realUrl = page.url();
-      const domain = new URL(realUrl).hostname;
+      const domain = (() => { try { return new URL(realUrl).hostname; } catch { return realUrl; } })();
 
       const screenshotPath = `step_${depth + 1}_${Date.now()}.png`;
       await page.screenshot({ path: screenshotPath, fullPage: true });
 
       const pageData = await page.evaluate(() => {
         const skip = new Set<Node>();
-        ['nav', 'footer', 'aside', 'header', '[aria-hidden="true"]',
-         '[class*="cookie"]', '[class*="nav"]', '[class*="footer"]',
-         '[class*="menu"]', '[class*="header"]', 'script', 'style', 'noscript',
-        ].forEach(sel => {
+        ['nav', 'footer', 'aside', 'header', '[aria-hidden="true"]', '[class*="cookie"]',
+         '[class*="nav"]', '[class*="footer"]', '[class*="menu"]', '[class*="header"]',
+         'script', 'style', 'noscript'].forEach(sel => {
           try { document.querySelectorAll(sel).forEach(el => skip.add(el)); } catch {}
         });
 
@@ -281,41 +450,33 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
             }
           });
           const parts: string[] = [];
-          let node: Node | null;
-          while ((node = walker.nextNode())) {
-            const t = (node.textContent || '').trim();
-            if (t.length > 2) parts.push(t);
-          }
+          let n: Node | null;
+          while ((n = walker.nextNode())) { const t = (n.textContent || '').trim(); if (t.length > 2) parts.push(t); }
           return parts.join('\n');
         }
 
         const mainEl = document.querySelector('main, article, [role="main"], .main, #main, section') || document.body;
         const rawText = getVisibleText(mainEl as Element);
+        const fullText = document.body.innerText || '';
+        const lower = fullText.toLowerCase();
 
-        const hasVideo = !!(
-          document.querySelector('video') ||
-          document.querySelector('iframe[src*="youtube"]') ||
-          document.querySelector('iframe[src*="vimeo"]') ||
-          document.querySelector('iframe[src*="wistia"]') ||
-          document.querySelector('iframe[src*="panda"]')
-        );
+        const hasVideo = !!(document.querySelector('video') ||
+          document.querySelector('iframe[src*="youtube"]') || document.querySelector('iframe[src*="vimeo"]') ||
+          document.querySelector('iframe[src*="wistia"]') || document.querySelector('iframe[src*="panda"]'));
 
         const videoSrc =
           (document.querySelector('video source') as HTMLSourceElement)?.src ||
           (document.querySelector('video') as HTMLVideoElement)?.src ||
+          (document.querySelector('iframe[src*="panda"]') as HTMLIFrameElement)?.src ||
           (document.querySelector('iframe[src*="youtube"]') as HTMLIFrameElement)?.src ||
-          (document.querySelector('iframe[src*="vimeo"]') as HTMLIFrameElement)?.src ||
-          (document.querySelector('iframe[src*="wistia"]') as HTMLIFrameElement)?.src ||
-          (document.querySelector('iframe[src*="panda"]') as HTMLIFrameElement)?.src || null;
+          (document.querySelector('iframe[src*="vimeo"]') as HTMLIFrameElement)?.src || null;
 
         const radioInputs = document.querySelectorAll('input[type="radio"]').length;
-        const fullText = document.body.innerText || '';
-        const lower = fullText.toLowerCase();
-
-        const hasUpsell   = lower.includes('leve também') || lower.includes('adicione ao pedido') || lower.includes('aproveite também') || lower.includes('oferta especial');
+        const hasUpsell   = lower.includes('leve também') || lower.includes('adicione ao pedido') || lower.includes('aproveite também');
         const hasDownsell = (lower.includes('espera') && (lower.includes('sair') || lower.includes('chance'))) || lower.includes('última chance');
-        const hasCheckout = lower.includes('checkout') || lower.includes('finalizar compra') || lower.includes('dados do cartão') || lower.includes('cartão de crédito');
-        const isQuiz      = radioInputs >= 2 || lower.includes('quiz') || lower.includes('próxima pergunta');
+        const hasCheckout = lower.includes('finalizar compra') || lower.includes('dados do cartão') || lower.includes('cartão de crédito') || lower.includes('número do cartão') || lower.includes('cvv') || lower.includes('boleto') || lower.includes('pix');
+        const hasQuizContent = lower.includes('quiz') || lower.includes('próxima pergunta') || lower.includes('qual é o seu') || lower.includes('como você se sente');
+        const isQuiz = !hasCheckout && ((radioInputs >= 2 && hasQuizContent) || (lower.includes('quiz') && !hasCheckout));
         const hasLongCopy = rawText.length > 500;
 
         const ctaKeywords = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'próximo', 'continuar', 'começar', 'inscrever'];
@@ -328,58 +489,74 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
           .map((a: any) => a.href as string)
           .filter((h: string) => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
 
-        const subdomains = [...new Set(
-          Array.from(document.querySelectorAll('a'))
-            .map((a: any) => { try { return new URL(a.href).hostname; } catch { return ''; } })
-            .filter(Boolean)
-        )];
-
-        return { title: document.title, rawText: rawText.substring(0, 3000), hasVideo, videoSrc, radioInputs, hasUpsell, hasDownsell, hasCheckout, isQuiz, hasLongCopy, ctaLinks: ctaLinks.slice(0, 3), waLinks: waLinks.slice(0, 2), subdomains: subdomains.slice(0, 5) };
+        return { rawText: rawText.substring(0, 3000), hasVideo, videoSrc, radioInputs, hasUpsell, hasDownsell, hasCheckout, isQuiz, hasLongCopy, ctaLinks: ctaLinks.slice(0, 3), waLinks: waLinks.slice(0, 2) };
       });
 
-      const pageType  = classifyPage(pageData.rawText, pageData.hasVideo, pageData.radioInputs);
+      const pageType = classifyPage(pageData.rawText, pageData.hasVideo, pageData.radioInputs, realUrl);
       const cleanCopy = extractSalesCopy(pageData.rawText);
       const platform  = detectPlatform(realUrl, pageData.rawText);
 
-      steps.push({ url: realUrl, domain, type: pageType, title: pageData.title, screenshotPath, videoSrc: pageData.videoSrc, hasVideo: pageData.hasVideo, hasUpsell: pageData.hasUpsell, hasDownsell: pageData.hasDownsell, hasCheckout: pageData.hasCheckout, isQuiz: pageData.isQuiz, hasLongCopy: pageData.hasLongCopy, copy: cleanCopy, subdomains: pageData.subdomains, platform });
+      steps.push({ url: realUrl, domain, type: pageType, screenshotPath, videoSrc: pageData.videoSrc, hasVideo: pageData.hasVideo, hasUpsell: pageData.hasUpsell, hasDownsell: pageData.hasDownsell, hasCheckout: pageData.hasCheckout, isQuiz: pageData.isQuiz, hasLongCopy: pageData.hasLongCopy, copy: cleanCopy, platform, rawText: pageData.rawText.substring(0, 1000) });
 
       let nextUrl: string | null = null;
-      if (pageData.waLinks.length > 0)  nextUrl = pageData.waLinks[0];
-      else if (pageData.ctaLinks.length > 0) nextUrl = pageData.ctaLinks[0];
+      if (pageData.waLinks.length > 0)       nextUrl = pageData.waLinks[0];
+      else if (pageData.ctaLinks.length > 0)  nextUrl = pageData.ctaLinks[0];
 
       if (nextUrl && !visited.has(nextUrl) && !nextUrl.includes('facebook.com')) currentUrl = nextUrl;
       else break;
-
       depth++;
-    } catch { break; }
+    } catch (e) { console.error('crawlFunnel step error:', e); break; }
     finally { await page.close(); }
   }
   return steps;
 }
 
-// ─── Collect + Score a single ad (no Telegram yet) ───────────────────────────
+// ─── Deduplicate ads by advertiser + landing domain ───────────────────────────
 
-async function collectAd(context: BrowserContext, rawCard: any, keyword: string, country: string): Promise<ScoredAd | null> {
+function deduplicateRawCards(rawCards: any[]): any[] {
+  const seen = new Map<string, { card: any; count: number }>();
+  for (const card of rawCards) {
+    const funnelUrl = (card.ctaLinks?.[0] || card.links?.[0] || '').toLowerCase();
+    let landingDomain = '';
+    try { landingDomain = new URL(funnelUrl).hostname; } catch {}
+    const key = `${card.advertiser.toLowerCase()}||${landingDomain}`;
+    const existing = seen.get(key);
+    if (existing) { existing.count++; }
+    else { seen.set(key, { card, count: 1 }); }
+  }
+  return Array.from(seen.values()).map(({ card, count }) => ({ ...card, similarCount: count }));
+}
+
+// ─── Collect + Score one ad ───────────────────────────────────────────────────
+
+async function collectAd(
+  context: BrowserContext,
+  rawCard: any,
+  keyword: string,
+  country: string,
+  history: History
+): Promise<ScoredAd | null> {
   try {
-    if (!rawCard) return null;
-    if (rawCard.text.includes('Biblioteca de Anúncios da Meta') || rawCard.text.length < 30) return null;
+    if (!rawCard || rawCard.text.length < 30) return null;
+    if (rawCard.text.includes('Biblioteca de Anúncios da Meta')) return null;
 
-    const price     = extractPrice(rawCard.text);
-    const priceLabel = price ? `R$ ${price.toFixed(2)} ✅` : '💡 Não identificado';
+    const funnelUrl: string | null = rawCard.ctaLinks?.[0] || rawCard.links?.[0] || null;
+    const landingDomain = (() => { try { return new URL(funnelUrl || '').hostname; } catch { return ''; } })();
+    const histKey = `${rawCard.advertiser.toLowerCase()}||${landingDomain}`;
 
-    // Download ad creative
-    let creativePath: string | null = null;
-    let creativeIsVideo = false;
-    if (rawCard.videos.length > 0) {
-      const p = `creative_${Date.now()}.mp4`;
-      if (await downloadFile(rawCard.videos[0], p)) { creativePath = p; creativeIsVideo = true; }
-    } else if (rawCard.images.length > 0) {
-      const p = `creative_${Date.now()}.jpg`;
-      if (await downloadFile(rawCard.images[0], p)) creativePath = p;
+    // Skip if recently analyzed
+    if (funnelUrl && wasRecentlyAnalyzed(history, histKey)) {
+      console.log(`[SKIP history] ${rawCard.advertiser} — ${landingDomain}`);
+      return null;
     }
 
-    const funnelUrl: string | null = (rawCard.ctaLinks && rawCard.ctaLinks[0]) || rawCard.links[0] || null;
+    const priceNum = extractPrice(rawCard.text);
+    const price    = priceNum ? `R$ ${priceNum.toFixed(2)} ✅` : '💡 Não identificado';
 
+    // Download creative with validation
+    const creative = await downloadCreative(rawCard);
+
+    // Crawl funnel
     let funnelStepData: any[] = [];
     if (funnelUrl && !funnelUrl.includes('facebook.com')) {
       funnelStepData = await crawlFunnel(context, funnelUrl);
@@ -393,37 +570,38 @@ async function collectAd(context: BrowserContext, rawCard: any, keyword: string,
     const hasLongCopy = funnelStepData.some(s => s.hasLongCopy) || rawCard.text.length > 300;
     const hasCTA      = (rawCard.ctaLinks?.length > 0) || funnelStepData.length > 0;
 
-    const score     = calculateScore({ hasVSL, hasQuiz, hasUpsell, hasDownsell, funnelSteps: funnelStepData.length, hasCTA, hasCheckout, hasLongCopy });
-    const domains   = [...new Set(funnelStepData.map((s: any) => s.domain))] as string[];
-    const platform  = funnelStepData.length > 0 ? (funnelStepData[0].platform || 'Direto') : detectPlatform(funnelUrl || '', rawCard.text);
+    const score      = calculateScore({ hasVSL, hasQuiz, hasUpsell, hasDownsell, funnelSteps: funnelStepData.length, hasCTA, hasCheckout, hasLongCopy });
+    const domains    = [...new Set(funnelStepData.map((s: any) => s.domain))] as string[];
+    const platform   = funnelStepData.length > 0 ? (funnelStepData[0].platform || 'Direto') : detectPlatform(funnelUrl || '', rawCard.text);
     const funnelType = funnelStepData.length > 0 ? funnelStepData.map((s: any) => s.type).join(' → ') : 'Direto';
+    const cleanCopy  = extractSalesCopy(rawCard.text, rawCard.advertiser);
+    const allFunnelText = funnelStepData.map((s: any) => s.rawText || '').join(' ');
+    const offerAnalysis = analyzeOffer(cleanCopy, allFunnelText);
 
-    // Clean copy — strip advertiser ID/name from card text
-    const cleanCopy = extractSalesCopy(rawCard.text, rawCard.advertiser);
+    markAnalyzed(history, histKey, score, rawCard.advertiser);
 
     return {
       advertiser: rawCard.advertiser,
       keyword,
       country,
       score,
-      price: priceLabel,
+      price,
+      priceNum,
       creativeType: rawCard.hasVideo ? '🎥 Vídeo' : '🖼 Imagem',
       dateText: rawCard.dateText,
-      hasVSL,
-      hasQuiz,
-      hasUpsell,
-      hasDownsell,
-      hasCheckout,
-      hasLongCopy,
+      hasVSL, hasQuiz, hasUpsell, hasDownsell, hasCheckout, hasLongCopy,
       funnelSteps: funnelStepData.length,
       funnelType,
       domains,
       platform,
       funnelUrl: funnelUrl || 'N/A',
+      landingDomain,
       cleanCopy,
-      creativePath,
-      creativeIsVideo,
+      creativePath: creative.path,
+      creativeIsVideo: creative.isVideo,
       funnelStepData,
+      offerAnalysis,
+      similarCount: rawCard.similarCount || 1,
     };
   } catch (err) {
     console.error('collectAd error:', err);
@@ -431,22 +609,24 @@ async function collectAd(context: BrowserContext, rawCard: any, keyword: string,
   }
 }
 
-// ─── Send a single scored ad to Telegram ──────────────────────────────────────
+// ─── Send Ad Report ───────────────────────────────────────────────────────────
 
-async function sendAdReport(ad: ScoredAd, rank: number, isBestToClone: boolean) {
+async function sendAdReport(ad: ScoredAd, rank: number, isBest: boolean) {
   const countryName = ad.country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿';
-  const cloneTag    = isBestToClone ? '\n\n🏆 <b>MELHOR OPÇÃO PARA CLONAR</b>' : '';
+  const dupNote     = ad.similarCount > 1 ? `\n⚠️ Anunciante roda <b>${ad.similarCount} anúncios similares</b>` : '';
+  const bestHeader  = isBest ? '\n🏆 <b>MELHOR OFERTA PARA CLONAR</b>' : '';
 
-  // 1. Creative (image or video)
+  // Creative
   if (ad.creativePath) {
-    const creativeCaption = `${isBestToClone ? '🏆 ' : ''}#${rank} | ${ad.advertiser} | ${ad.keyword}`;
-    if (ad.creativeIsVideo) await sendVideo(ad.creativePath, creativeCaption);
-    else                    await sendPhoto(ad.creativePath, creativeCaption);
+    const cap = `${isBest ? '🏆 ' : ''}#${rank} ${ad.advertiser} | ${ad.keyword}`;
+    if (ad.creativeIsVideo) await sendVideo(ad.creativePath, cap);
+    else                    await sendPhoto(ad.creativePath, cap);
   }
 
-  // 2. Main report card
+  // Main card
+  const offer = ad.offerAnalysis;
   await sendToTelegram(`\
-🎯 <b>#${rank} | ${ad.keyword} | ${countryName}</b>${cloneTag}
+🎯 <b>#${rank} | ${ad.keyword} | ${countryName}</b>${bestHeader}${dupNote}
 
 ⭐ <b>Score: ${ad.score}/10</b>
 🏢 <b>Anunciante:</b> ${ad.advertiser}
@@ -455,6 +635,11 @@ async function sendAdReport(ad: ScoredAd, rank: number, isBestToClone: boolean) 
 🏪 <b>Plataforma:</b> ${ad.platform}
 📅 <b>Data início:</b> ${ad.dateText || 'Desconhecida'}
 
+📦 <b>OFERTA:</b> ${offer.product}
+💡 <b>Promessa:</b> ${offer.mainPromise}
+${offer.hasBonus ? '🎁 Bônus: ✅' : ''} ${offer.hasUrgency ? '⏰ Urgência: ✅' : ''} ${offer.hasGuarantee ? '🛡️ Garantia: ✅' : ''} ${offer.hasRecurring ? '🔄 Recorrente: ✅' : ''}
+💪 <b>CTA:</b> ${offer.ctaStrength}
+
 📊 <b>Funil (${ad.funnelSteps} etapas):</b> ${ad.funnelType}
 🎬 VSL: ${ad.hasVSL ? '✅' : '❌'} | 🧩 Quiz: ${ad.hasQuiz ? '✅' : '❌'}
 ⬆️ Upsell: ${ad.hasUpsell ? '✅' : '❌'} | ⬇️ Downsell: ${ad.hasDownsell ? '✅' : '❌'}
@@ -462,28 +647,30 @@ async function sendAdReport(ad: ScoredAd, rank: number, isBestToClone: boolean) 
 🌐 <b>Domínios:</b> ${ad.domains.length > 0 ? ad.domains.join(', ') : 'N/A'}
 🔗 <b>Funil:</b> ${ad.funnelUrl}`);
 
-  // 3. Ad copy (clean)
+  // Copy
   if (ad.cleanCopy.length > 20) {
     await sendToTelegram(`📝 <b>COPY DO ANÚNCIO:</b>\n${ad.cleanCopy.substring(0, 600)}`);
   }
 
-  // 4. Funnel step screenshots + VSL video + page copy
+  // Best-to-clone explanation
+  if (isBest) {
+    const reasons = buildCloneReasons(ad);
+    await sendToTelegram(`🏆 <b>POR QUE CLONAR ESTA OFERTA:</b>\n${reasons}`);
+  }
+
+  // Funnel screenshots + VSL video per step
   for (let i = 0; i < ad.funnelStepData.length; i++) {
     const step = ad.funnelStepData[i];
-
-    if (step.type === 'VSL' && step.videoSrc && step.videoSrc.startsWith('http')) {
-      const vslPath = `vsl_${Date.now()}.mp4`;
-      const ok = await downloadFile(step.videoSrc, vslPath);
-      if (ok && fs.existsSync(vslPath)) {
+    if (step.type === 'VSL' && step.videoSrc) {
+      const vslPath = await downloadVSL(step.videoSrc);
+      if (vslPath) {
         await sendVideo(vslPath, `🎬 VSL — Etapa ${i + 1} | ${step.domain}`);
       } else {
-        if (step.screenshotPath) await sendPhoto(step.screenshotPath, `📸 VSL — Etapa ${i + 1} | ${step.domain}`);
+        if (step.screenshotPath) await sendScreenshot(step.screenshotPath, `📸 VSL — Etapa ${i + 1} | ${step.domain}`);
       }
     } else {
-      if (step.screenshotPath) await sendPhoto(step.screenshotPath, `📸 Etapa ${i + 1} — ${step.type} | ${step.domain}`);
+      if (step.screenshotPath) await sendScreenshot(step.screenshotPath, `📸 Etapa ${i + 1} — ${step.type} | ${step.domain}`);
     }
-
-    // Send page copy for first step only
     if (i === 0 && step.copy && step.copy.length > 30) {
       await sendToTelegram(`📝 <b>COPY DA PÁGINA (${step.type}):</b>\n${step.copy.substring(0, 600)}`);
     }
@@ -493,11 +680,18 @@ async function sendAdReport(ad: ScoredAd, rank: number, isBestToClone: boolean) 
   await delay(1500);
 }
 
-// ─── Scrape one keyword: collect all → rank → send top N ─────────────────────
+// ─── Scrape one keyword ───────────────────────────────────────────────────────
 
-async function scrapeKeyword(keyword: string, country: string, context: BrowserContext, page: Page) {
+async function scrapeKeyword(
+  keyword: string,
+  country: string,
+  context: BrowserContext,
+  page: Page,
+  history: History,
+  keywordScores: Map<string, number[]>
+): Promise<void> {
   const countryName = country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿';
-  const searchUrl = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=${country}&q=${encodeURIComponent(keyword)}&search_type=keyword_unordered`;
+  const searchUrl   = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=${country}&q=${encodeURIComponent(keyword)}&search_type=keyword_unordered`;
 
   try {
     await sendToTelegram(`🔎 <b>PESQUISANDO:</b> ${keyword} — ${countryName}`);
@@ -506,23 +700,21 @@ async function scrapeKeyword(keyword: string, country: string, context: BrowserC
     await page.evaluate(() => window.scrollBy(0, 800));
     await delay(3000);
 
-    // Screenshot of the results page
-    const libScreenshot = `lib_${Date.now()}.png`;
-    await page.screenshot({ path: libScreenshot });
-    await sendPhoto(libScreenshot, `🔍 ${keyword} — ${countryName}`);
+    const libShot = `lib_${Date.now()}.png`;
+    await page.screenshot({ path: libShot });
+    await sendScreenshot(libShot, `🔍 ${keyword} — ${countryName}`);
 
-    // Locate ad cards via "Patrocinado" label
     const sponsoredLocator = page.getByText('Patrocinado', { exact: true });
     let count = 0;
     try {
       await sponsoredLocator.first().waitFor({ timeout: 12000 });
-      count = Math.min(await sponsoredLocator.count(), MAX_ADS_PER_KEYWORD);
+      count = Math.min(await sponsoredLocator.count(), MAX_ADS_COLLECT);
     } catch {
-      const engLocator = page.getByText('Sponsored', { exact: true });
       try {
-        await engLocator.first().waitFor({ timeout: 5000 });
-        count = Math.min(await engLocator.count(), MAX_ADS_PER_KEYWORD);
-      } catch { /* no ads */ }
+        const eng = page.getByText('Sponsored', { exact: true });
+        await eng.first().waitFor({ timeout: 5000 });
+        count = Math.min(await eng.count(), MAX_ADS_COLLECT);
+      } catch {}
     }
 
     if (count === 0) {
@@ -530,151 +722,211 @@ async function scrapeKeyword(keyword: string, country: string, context: BrowserC
       return;
     }
 
-    await sendToTelegram(`⏳ <b>${count} anúncios encontrados.</b> Analisando e rankeando...`);
+    await sendToTelegram(`⏳ <b>${count} anúncios encontrados.</b> Coletando e analisando...`);
 
-    // ── Step 1: extract raw card data from the page ──────────────────────────
+    // ── Step 1: read raw card data ────────────────────────────────────────────
     const rawCards: any[] = [];
     for (let i = 0; i < count; i++) {
       try {
-        const sponsoredEl = sponsoredLocator.nth(i);
-        const cardLocator = sponsoredEl.locator('xpath=ancestor::div[.//a[@role="link"]][1]');
+        const sponsored = sponsoredLocator.nth(i);
+        const card = sponsored.locator('xpath=ancestor::div[.//a[@role="link"]][1]');
 
-        const raw = await cardLocator.evaluate((cardEl: HTMLElement) => {
-          function extractRealUrl(href: string): string | null {
+        const raw = await card.evaluate((el: HTMLElement) => {
+          function realUrl(href: string): string | null {
             if (!href) return null;
             if (href.includes('l.facebook.com/l.php') || href.includes('lm.facebook.com')) {
-              try {
-                const u = new URL(href).searchParams.get('u');
-                if (u) return decodeURIComponent(u);
-              } catch {}
+              try { const u = new URL(href).searchParams.get('u'); if (u) return decodeURIComponent(u); } catch {}
               return null;
             }
-            if (href.startsWith('http') && !href.includes('facebook.com') && !href.includes('fb.com') && !href.includes('fb.me') && !href.includes('instagram.com')) return href;
+            if (href.startsWith('http') && !href.includes('facebook.com') && !href.includes('fb.com') && !href.includes('instagram.com')) return href;
             return null;
           }
 
-          const advertiserEl = cardEl.querySelector('a[role="link"]') as HTMLElement | null;
-          const advertiser = advertiserEl?.innerText?.trim() || 'Desconhecido';
+          const advertiserEl = el.querySelector('a[role="link"]') as HTMLElement | null;
+          const advertiser   = advertiserEl?.innerText?.trim() || 'Desconhecido';
 
-          // Get text EXCLUDING the advertiser name element to avoid ID bleed
+          // Build text EXCLUDING the advertiser anchor to avoid ID bleed
           let text = '';
-          cardEl.childNodes.forEach(node => {
+          el.childNodes.forEach(node => {
             if (node !== advertiserEl && !(node as HTMLElement).contains?.(advertiserEl)) {
-              text += (node as HTMLElement).innerText || (node.textContent || '');
+              text += (node as HTMLElement).innerText || node.textContent || '';
             }
           });
-          // Fallback: use all innerText but strip the advertiser name from start
           if (!text.trim()) {
-            text = cardEl.innerText || '';
+            text = el.innerText || '';
             if (advertiser && text.startsWith(advertiser)) text = text.slice(advertiser.length);
           }
 
-          const images = Array.from(cardEl.querySelectorAll('img'))
-            .map((img: any) => img.src as string)
-            .filter((src: string) => src && src.startsWith('https://') && src.includes('fbcdn') && !src.includes('emoji'));
+          // Images: try src, data-src, srcset
+          const images: string[] = [];
+          el.querySelectorAll('img').forEach((img: any) => {
+            const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+            if (src && src.startsWith('https://') && (src.includes('fbcdn') || src.includes('fbsbx'))) images.push(src);
+            // Also try srcset — pick largest
+            const ss = img.getAttribute('srcset') || '';
+            if (ss) {
+              const biggest = ss.split(',').map((s: string) => s.trim()).filter((s: string) => s)
+                .map((s: string) => { const [u, w] = s.split(' '); return { u, w: parseInt(w || '0') }; })
+                .sort((a: any, b: any) => b.w - a.w)[0];
+              if (biggest?.u && biggest.u.startsWith('http')) images.push(biggest.u);
+            }
+          });
 
-          const videos = Array.from(cardEl.querySelectorAll('video'))
-            .map((v: any) => v.src as string)
-            .filter(Boolean);
+          // Background images from inline styles
+          const bgImages: string[] = [];
+          el.querySelectorAll('[style*="background"]').forEach((node: any) => {
+            const m = (node.style.backgroundImage || '').match(/url\(["']?(https?[^"')]+)["']?\)/);
+            if (m && m[1]) bgImages.push(m[1]);
+          });
 
-          const ctaKeywords = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'continuar', 'começar', 'ver mais', 'obter', 'inscrever', 'assinar'];
-          const ctaLinks = Array.from(cardEl.querySelectorAll('a'))
-            .filter((a: any) => { const t = (a.innerText || '').toLowerCase(); return ctaKeywords.some(k => t.includes(k)); })
-            .map((a: any) => extractRealUrl(a.href))
-            .filter((h: string | null): h is string => h !== null);
+          const videos = Array.from(el.querySelectorAll('video')).map((v: any) => v.src as string).filter(Boolean);
 
-          const allLinks = Array.from(cardEl.querySelectorAll('a'))
-            .map((a: any) => extractRealUrl(a.href))
-            .filter((h: string | null): h is string => h !== null);
-
-          const waLinks = Array.from(cardEl.querySelectorAll('a'))
-            .map((a: any) => a.href as string)
-            .filter((h: string) => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
-
+          const ctaKeys = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'continuar', 'começar', 'ver mais', 'obter', 'inscrever', 'assinar'];
+          const ctaLinks = Array.from(el.querySelectorAll('a'))
+            .filter((a: any) => { const t = (a.innerText || '').toLowerCase(); return ctaKeys.some(k => t.includes(k)); })
+            .map((a: any) => realUrl(a.href)).filter((h: any): h is string => h !== null);
+          const allLinks = Array.from(el.querySelectorAll('a')).map((a: any) => realUrl(a.href)).filter((h: any): h is string => h !== null);
+          const waLinks  = Array.from(el.querySelectorAll('a')).map((a: any) => a.href as string).filter((h: string) => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
           const dateMatch = text.match(/(\d+)\s*de\s*(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/i);
 
-          return {
-            text: text.substring(0, 1000),
-            images: images.slice(0, 2),
-            videos: videos.slice(0, 1),
-            hasVideo: videos.length > 0,
-            advertiser,
-            dateText: dateMatch ? dateMatch[0] : null,
-            ctaLinks: ctaLinks.slice(0, 3),
-            links: allLinks.slice(0, 3),
-            waLinks: waLinks.slice(0, 2),
-          };
+          return { text: text.substring(0, 1000), images: [...new Set(images)].slice(0, 3), backgroundImages: bgImages.slice(0, 2), videos: videos.slice(0, 2), hasVideo: videos.length > 0, advertiser, dateText: dateMatch ? dateMatch[0] : null, ctaLinks: ctaLinks.slice(0, 3), links: allLinks.slice(0, 3), waLinks: waLinks.slice(0, 2) };
         });
 
         rawCards.push(raw);
-      } catch (err) {
-        console.error(`Erro ao ler card ${i}:`, err);
-      }
+      } catch (err) { console.error(`Card ${i} read error:`, err); }
     }
 
-    // ── Step 2: crawl each funnel + score ────────────────────────────────────
+    // ── Step 2: deduplicate ───────────────────────────────────────────────────
+    const dedupedCards = deduplicateRawCards(rawCards);
+    console.log(`[${keyword}] ${rawCards.length} raw → ${dedupedCards.length} unique after dedup`);
+
+    // ── Step 3: collect + score each unique ad ────────────────────────────────
     const scored: ScoredAd[] = [];
-    for (const raw of rawCards) {
-      const result = await collectAd(context, raw, keyword, country);
+    for (const raw of dedupedCards) {
+      const result = await collectAd(context, raw, keyword, country, history);
       if (result) scored.push(result);
       await delay(1500);
     }
 
     if (scored.length === 0) {
-      await sendToTelegram(`⚠️ Nenhum anúncio válido para <b>${keyword}</b>`);
+      await sendToTelegram(`⚠️ Nenhum anúncio novo/válido para <b>${keyword}</b>`);
       return;
     }
 
-    // ── Step 3: rank by score descending, take top N ─────────────────────────
+    // ── Step 4: rank and send top N ───────────────────────────────────────────
     scored.sort((a, b) => b.score - a.score);
-    const topAds = scored.slice(0, MAX_SEND_PER_KEYWORD);
+    const topAds = scored.slice(0, MAX_ADS_SEND);
 
-    await sendToTelegram(`📊 <b>RANKING — ${keyword} | ${countryName}</b>\n${topAds.map((a, i) => `${i + 1}. ${a.advertiser} — Score: ${a.score}/10`).join('\n')}\n\n🏆 Melhor para clonar: <b>${topAds[0].advertiser}</b>`);
+    // Track keyword scores for final ranking
+    const kKey = `${country}::${keyword}`;
+    if (!keywordScores.has(kKey)) keywordScores.set(kKey, []);
+    topAds.forEach(a => keywordScores.get(kKey)!.push(a.score));
 
-    // ── Step 4: send each ad report ──────────────────────────────────────────
+    const rankingLines = topAds.map((a, i) => `${i + 1}. <b>${a.advertiser}</b> — ${a.score}/10${a.similarCount > 1 ? ` (${a.similarCount} ads similares)` : ''}`).join('\n');
+    await sendToTelegram(`📊 <b>RANKING — ${keyword} | ${countryName}</b>\n${rankingLines}\n\n🏆 Melhor para clonar: <b>${topAds[0].advertiser}</b>`);
+
     for (let i = 0; i < topAds.length; i++) {
       await sendAdReport(topAds[i], i + 1, i === 0);
     }
 
-    await sendToTelegram(`✅ <b>CONCLUÍDO:</b> ${keyword} — ${topAds.length} ads enviados (${scored.length} analisados)`);
+    // Persist history after each keyword
+    saveHistory(history);
+
+    await sendToTelegram(`✅ <b>CONCLUÍDO:</b> ${keyword} — ${topAds.length} ads enviados (${scored.length} únicos analisados de ${rawCards.length} encontrados)`);
 
   } catch (err) {
-    console.error(`Erro keyword "${keyword}":`, err);
+    console.error(`Keyword error "${keyword}":`, err);
   }
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Final Keyword Ranking ────────────────────────────────────────────────────
 
-async function main() {
+async function sendKeywordRanking(keywordScores: Map<string, number[]>) {
+  if (keywordScores.size === 0) return;
+  const ranked = Array.from(keywordScores.entries())
+    .map(([k, scores]) => ({ key: k, avg: scores.reduce((a, b) => a + b, 0) / scores.length, max: Math.max(...scores) }))
+    .sort((a, b) => b.avg - a.avg);
+
+  let msg = `🔥 <b>RANKING FINAL DE KEYWORDS DO CICLO</b>\n\n`;
+  ranked.slice(0, 15).forEach((k, i) => {
+    const [country, ...kwParts] = k.key.split('::');
+    msg += `${i + 1}. <b>${kwParts.join('::')}</b> (${country})\n`;
+    msg += `   Avg score: ${k.avg.toFixed(1)}/10 | Melhor: ${k.max}/10\n\n`;
+  });
+  msg += `\n🔥 <b>MELHOR KEYWORD PARA COMEÇAR:</b> ${(() => { const [, ...p] = ranked[0].key.split('::'); return p.join('::'); })()}`;
+  await sendToTelegram(msg);
+}
+
+// ─── Main Loop (autonomous, crash-resilient) ──────────────────────────────────
+
+async function runCycle(history: History, keywordScores: Map<string, number[]>) {
   const browser = await chromium.launch({
     headless: true,
     executablePath: process.env.REPLIT_PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
   });
 
-  await sendToTelegram(`🚀 <b>Agente v3 iniciado!</b>\n🌍 Brasil 🇧🇷 + Moçambique 🇲🇿\n💡 Lógica: coleta todos os ads → ranqueia → envia Top ${MAX_SEND_PER_KEYWORD} por keyword`);
+  try {
+    for (const country of COUNTRIES) {
+      for (const [category, keywords] of Object.entries(KEYWORD_CATEGORIES)) {
+        await sendToTelegram(`\n📂 <b>CATEGORIA: ${category}</b> | ${country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿'}`);
 
-  for (const country of COUNTRIES) {
-    for (const [category, keywords] of Object.entries(KEYWORD_CATEGORIES)) {
-      await sendToTelegram(`\n📂 <b>CATEGORIA: ${category}</b> | ${country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿'}`);
+        const context = await browser.newContext({
+          locale: country === 'BR' ? 'pt-BR' : 'pt-MZ',
+          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+          viewport: { width: 1920, height: 1080 },
+        });
+        const page = await context.newPage();
 
-      const context = await browser.newContext({
-        locale: country === 'BR' ? 'pt-BR' : 'pt-MZ',
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        viewport: { width: 1920, height: 1080 },
-      });
-      const page = await context.newPage();
+        for (const keyword of keywords) {
+          await scrapeKeyword(keyword, country, context, page, history, keywordScores);
 
-      for (const keyword of keywords) {
-        await scrapeKeyword(keyword, country, context, page);
-        await delay(4000);
+          // 15-minute gap between keywords
+          console.log(`[WAIT] 15 min before next keyword...`);
+          await sendToTelegram(`⏱️ Aguardando 15 min antes da próxima keyword...`);
+          await delay(KEYWORD_GAP_MS);
+        }
+
+        await context.close();
       }
-
-      await context.close();
     }
+  } finally {
+    await browser.close();
   }
-
-  await browser.close();
-  await sendToTelegram(`✅ <b>Pesquisa completa!</b> Todas as categorias analisadas.`);
 }
 
-main().catch(console.error);
+async function main() {
+  const history: History = loadHistory();
+  const keywordScores    = new Map<string, number[]>();
+  let cycleNum = 1;
+
+  await sendToTelegram(`🚀 <b>Agente v4 — Motor Autônomo Iniciado!</b>\n🌍 Brasil 🇧🇷 + Moçambique 🇲🇿\n⏱️ 15 min entre keywords | 🔄 Ciclo contínuo\n📋 Histórico: ${Object.keys(history).length} entradas carregadas`);
+
+  while (true) {
+    console.log(`\n═══════════ CICLO ${cycleNum} ═══════════`);
+    await sendToTelegram(`\n🔄 <b>INICIANDO CICLO ${cycleNum}</b>`);
+    try {
+      await runCycle(history, keywordScores);
+      await sendKeywordRanking(keywordScores);
+      saveHistory(history);
+      await sendToTelegram(`✅ <b>CICLO ${cycleNum} COMPLETO!</b>\nPróximo ciclo em 22 horas...`);
+    } catch (err) {
+      console.error(`Cycle ${cycleNum} crashed:`, err);
+      await sendToTelegram(`⚠️ <b>Erro no ciclo ${cycleNum}. Reiniciando em 5 minutos...</b>`);
+      await delay(5 * 60 * 1000); // 5 min recovery pause
+      cycleNum++;
+      continue;
+    }
+
+    cycleNum++;
+    keywordScores.clear(); // reset per-cycle scores
+    await delay(CYCLE_SLEEP_MS); // sleep 22 h before next cycle
+  }
+}
+
+main().catch(async (err) => {
+  console.error('Fatal error:', err);
+  try { await sendToTelegram(`🚨 <b>Erro fatal — reiniciando em 2 min:</b> ${String(err).substring(0, 200)}`); } catch {}
+  await delay(2 * 60 * 1000);
+  main().catch(console.error); // self-restart on fatal error
+});

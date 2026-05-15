@@ -1,0 +1,133 @@
+More important refinements to the funnel intelligence logic.
+
+1. OFFER ANALYSIS IS MISSING
+   The ranking system is still incomplete because it does NOT analyze the actual OFFER clearly.
+
+The system must identify:
+
+* what exactly is being sold
+* the main promise
+* price positioning
+* offer structure
+* bonuses
+* urgency/scarcity
+* recurring vs one-time offer
+
+Then explain WHY an ad scored highly.
+
+2. BEST OFFER TO CLONE
+   Do NOT only say:
+   "best ad"
+
+Instead clearly explain:
+🏆 BEST OFFER TO CLONE
+
+And include:
+
+* why this offer is strongest
+* what makes the funnel better
+* strongest angle
+* strongest creative
+* strongest CTA
+* strongest quiz/VSL structure
+
+3. DUPLICATE ADS PROBLEM
+   Current issue:
+   One advertiser may have many very similar ads.
+
+The crawler currently enters:
+
+* ad 1
+* ad 2
+* ad 3
+* ad 4
+
+Even though they are basically the same funnel.
+
+This is wrong.
+
+Fix:
+
+* detect duplicate/similar ads
+* group ads by:
+
+  * advertiser
+  * landing page
+  * funnel structure
+  * offer similarity
+* avoid analyzing clones of the same ad repeatedly
+
+If 10 ads lead to the same funnel:
+
+* analyze only ONE deeply
+* mention:
+  "Advertiser has X similar ads running"
+
+4. DAILY ROTATION / MEMORY
+   The system should remember analyzed ads.
+
+If an ad/funnel was already analyzed recently:
+
+* avoid reprocessing it again the next day unless changed
+
+Goal:
+avoid repetitive reports.
+
+5. KEYWORD PRIORITY ANALYSIS
+   After all keywords finish processing:
+
+Create a FINAL RANKING of keywords.
+
+Example:
+
+1. PDF por apenas 10 reais
+2. Quiz emagrecimento
+3. Planner financeiro
+
+Based on:
+
+* average funnel quality
+* strongest offers
+* best creatives
+* strongest VSLs
+* best conversion structure
+
+Then explicitly recommend:
+🔥 BEST KEYWORD TO START WITH
+
+6. SEARCH INTERVALS
+   Do NOT process keywords continuously.
+
+After finishing one keyword:
+
+* wait 15 minutes
+* then process the next keyword
+
+This is important to:
+
+* reduce Facebook detection risk
+* reduce repetitive crawling
+* improve stability
+
+7. KEEP CURRENT SYSTEM
+   Do not rewrite everything.
+
+Keep:
+
+* Telegram integration
+* crawler
+* traversal logic
+* screenshots
+* VSL detection
+
+Only improve:
+
+* intelligence
+* deduplication
+* offer analysis
+* ranking
+* keyword prioritization
+* memory/history system
+
+8. AFTER FINISHING
+   Immediately restart the crawler automatically and verify Telegram delivery successfully.
