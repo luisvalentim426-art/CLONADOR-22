@@ -11,36 +11,51 @@ const bot = new TelegramBot(process.env.TELEGRAM_TOKEN!, { polling: false });
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 
 const KEYWORD_CATEGORIES: { [key: string]: string[] } = {
-  'PDF': ['PDF por apenas 9,99', 'PDF por apenas 10', 'PDF por apenas 17', 'PDF por apenas 27', 'PDF por apenas 37', 'PDF por apenas 47'],
-  'Receitas': ['Receitas por apenas 9,99', 'Receitas por apenas 10', 'Receitas por apenas 17', 'Receitas por apenas 27', 'Receitas por apenas 37'],
-  'Planner': ['Planner por apenas 9,99', 'Planner por apenas 10', 'Planner por apenas 17', 'Planner por apenas 27', 'Planner por apenas 37'],
-  'Apostila': ['Apostila por apenas 9,99', 'Apostila por apenas 10', 'Apostila por apenas 17', 'Apostila por apenas 27'],
-  'Moldes': ['Moldes por apenas 10', 'Moldes por apenas 17', 'Moldes por apenas 27'],
-  'Kit': ['Kit completo por apenas 10', 'Kit completo por apenas 17', 'Kit completo por apenas 27', 'Kit completo por apenas 37'],
-  'Aulas': ['Aulas prontas por apenas 17', 'Aulas prontas por apenas 27', 'Aulas prontas por apenas 37'],
-  'Material': ['Material pronto por apenas 17', 'Material pronto por apenas 27'],
-  'Pacote': ['Pacote por apenas 9,99', 'Pacote por apenas 10', 'Pacote por apenas 17', 'Pacote por apenas 27'],
+  'PDF':       ['PDF por apenas 9,99', 'PDF por apenas 10', 'PDF por apenas 17', 'PDF por apenas 27', 'PDF por apenas 37', 'PDF por apenas 47'],
+  'Receitas':  ['Receitas por apenas 9,99', 'Receitas por apenas 10', 'Receitas por apenas 17', 'Receitas por apenas 27', 'Receitas por apenas 37'],
+  'Planner':   ['Planner por apenas 9,99', 'Planner por apenas 10', 'Planner por apenas 17', 'Planner por apenas 27', 'Planner por apenas 37'],
+  'Apostila':  ['Apostila por apenas 9,99', 'Apostila por apenas 10', 'Apostila por apenas 17', 'Apostila por apenas 27'],
+  'Moldes':    ['Moldes por apenas 10', 'Moldes por apenas 17', 'Moldes por apenas 27'],
+  'Kit':       ['Kit completo por apenas 10', 'Kit completo por apenas 17', 'Kit completo por apenas 27', 'Kit completo por apenas 37'],
+  'Aulas':     ['Aulas prontas por apenas 17', 'Aulas prontas por apenas 27', 'Aulas prontas por apenas 37'],
+  'Material':  ['Material pronto por apenas 17', 'Material pronto por apenas 27'],
+  'Pacote':    ['Pacote por apenas 9,99', 'Pacote por apenas 10', 'Pacote por apenas 17', 'Pacote por apenas 27'],
   'Dinamicas': ['Dinâmicas por apenas 17', 'Dinâmicas por apenas 27'],
-  'Baixe': ['Baixe agora por apenas 9,99', 'Baixe agora por apenas 10', 'Baixe agora por apenas 17']
+  'Baixe':     ['Baixe agora por apenas 9,99', 'Baixe agora por apenas 10', 'Baixe agora por apenas 17'],
 };
 
 const COUNTRIES = ['BR', 'MZ'];
-const MAX_ADS_PER_KEYWORD = 10;
-const MIN_QUALITY_SCORE = 7;
+const MAX_ADS_PER_KEYWORD = 10;   // max ads to collect per keyword
+const MAX_SEND_PER_KEYWORD = 10;  // max to send after ranking
 
-interface AdScore {
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface ScoredAd {
   advertiser: string;
   keyword: string;
-  score: number;
+  country: string;
+  score: number;                // 1–10
   price: string;
   creativeType: string;
-  daysRunning: number;
-  hasUpsell: boolean;
-  hasDownsell: boolean;
+  dateText: string | null;
   hasVSL: boolean;
   hasQuiz: boolean;
+  hasUpsell: boolean;
+  hasDownsell: boolean;
+  hasCheckout: boolean;
+  hasLongCopy: boolean;
+  funnelSteps: number;
+  funnelType: string;
+  domains: string[];
+  platform: string;
   funnelUrl: string;
+  cleanCopy: string;
+  creativePath: string | null;
+  creativeIsVideo: boolean;
+  funnelStepData: any[];
 }
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
 
 function delay(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -50,7 +65,7 @@ async function sendToTelegram(message: string) {
   try {
     await bot.sendMessage(CHAT_ID, message, { parse_mode: 'HTML', disable_web_page_preview: true });
   } catch (err) {
-    console.error('Telegram error:', err);
+    console.error('Telegram send error:', err);
   }
 }
 
@@ -111,7 +126,8 @@ function extractPrice(text: string): number | null {
   return null;
 }
 
-// 0-10 quality score
+// ─── Scoring (1–10) ───────────────────────────────────────────────────────────
+
 function calculateScore(data: {
   hasVSL: boolean;
   hasQuiz: boolean;
@@ -123,33 +139,36 @@ function calculateScore(data: {
   hasLongCopy: boolean;
 }): number {
   let score = 0;
-  if (data.hasVSL) score += 2;
-  if (data.hasQuiz) score += 2;
+  if (data.hasVSL)                    score += 2;
+  if (data.hasQuiz)                   score += 2;
   if (data.hasUpsell || data.hasDownsell) score += 2;
-  if (data.funnelSteps > 1) score += 1;
-  if (data.hasCTA) score += 1;
-  if (data.hasCheckout) score += 1;
-  if (data.hasLongCopy) score += 1;
-  return Math.min(score, 10);
+  if (data.funnelSteps > 1)           score += 1;
+  if (data.hasCTA)                    score += 1;
+  if (data.hasCheckout)               score += 1;
+  if (data.hasLongCopy)               score += 1;
+  return Math.max(1, Math.min(score, 10));  // floor 1, ceiling 10
 }
 
+// ─── Platform Detection ───────────────────────────────────────────────────────
+
 function detectPlatform(url: string, text: string): string {
-  if (url.includes('hotmart.com') || url.includes('hotmart.product')) return 'Hotmart';
-  if (url.includes('kiwify.com.br') || url.includes('kiwify.app')) return 'Kiwify';
-  if (url.includes('eduzz.com') || url.includes('sun.eduzz.com')) return 'Eduzz';
-  if (url.includes('monetizze.com.br')) return 'Monetizze';
-  if (url.includes('pepper.com.br')) return 'Pepper';
-  if (url.includes('braip.com')) return 'Braip';
-  if (url.includes('pay.') || url.includes('/checkout')) return 'Checkout';
-  if (url.includes('wa.me') || url.includes('whatsapp')) return 'WhatsApp';
-  if (text.toLowerCase().includes('hotmart')) return 'Hotmart';
-  if (text.toLowerCase().includes('kiwify')) return 'Kiwify';
+  const u = url.toLowerCase();
+  const t = text.toLowerCase();
+  if (u.includes('hotmart.com') || u.includes('hotmart.product') || t.includes('hotmart')) return 'Hotmart';
+  if (u.includes('kiwify.com.br') || u.includes('kiwify.app') || t.includes('kiwify'))    return 'Kiwify';
+  if (u.includes('eduzz.com') || u.includes('sun.eduzz') || t.includes('eduzz'))           return 'Eduzz';
+  if (u.includes('monetizze.com.br') || t.includes('monetizze'))                           return 'Monetizze';
+  if (u.includes('pepper.com.br') || t.includes('pepper'))                                 return 'Pepper';
+  if (u.includes('braip.com') || t.includes('braip'))                                       return 'Braip';
+  if (u.includes('wa.me') || u.includes('whatsapp'))                                       return 'WhatsApp';
+  if (u.includes('/checkout') || u.includes('pay.'))                                       return 'Checkout direto';
   return 'Direto';
 }
 
+// ─── Page Classifier ──────────────────────────────────────────────────────────
+
 function classifyPage(text: string, hasVideo: boolean, radioInputs: number): string {
   const lower = text.toLowerCase();
-  if (hasVideo && (lower.includes('assista') || lower.includes('vídeo') || lower.includes('video') || lower.includes('assista até o fim'))) return 'VSL';
   if (hasVideo) return 'VSL';
   if (radioInputs >= 2 || lower.includes('quiz') || lower.includes('próxima pergunta')) return 'QUIZ';
   if (lower.includes('checkout') || lower.includes('finalizar compra') || lower.includes('dados do cartão')) return 'CHECKOUT';
@@ -159,49 +178,64 @@ function classifyPage(text: string, hasVideo: boolean, radioInputs: number): str
   return 'LANDING';
 }
 
-// Extract clean sales copy, ignoring nav/footer/UI noise
-function extractSalesCopy(rawText: string): string {
+// ─── Copy Cleaner ─────────────────────────────────────────────────────────────
+// Strips advertiser names, numeric IDs, nav noise — returns natural sales copy
+
+function extractSalesCopy(rawText: string, advertiserName?: string): string {
   const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
 
-  const ignorePatterns = [
+  const skipPatterns: RegExp[] = [
+    /^\d{5,}$/,                                          // pure numeric IDs (5+ digits)
+    /^[\d\s\-_|•·]{3,}$/,                               // lines of only numbers/symbols
     /^(ac|al|am|ap|ba|ce|df|es|go|ma|mg|ms|mt|pa|pb|pe|pi|pr|rj|rn|ro|rr|rs|sc|se|sp|to)$/i,
-    /^[a-záàâãéêíóôõúç]{2,20}(,\s*[a-záàâãéêíóôõúç]{2,20}){2,}$/i,
-    /^(home|menu|início|sobre|contato|política|privacidade|termos|copyright|todos os direitos|©|\d{4})/i,
-    /^(carrinho|minha conta|entrar|sair|cadastro|login|buscar|pesquisar)$/i,
-    /^(aceitar cookies|cookies|fechar|ok|sim|não|voltar|próximo|anterior)$/i,
-    /^(facebook|instagram|youtube|twitter|tiktok|whatsapp)$/i,
-    /^.{1,15}$/, // very short fragments
-    /^(\d+)$/, // pure numbers
-    /^[^a-záàâãéêíóôõúç]*$/, // no actual words
+    /^(home|menu|início|sobre|contato|política|privacidade|termos|copyright|©|\d{4})/i,
+    /^(carrinho|minha conta|entrar|sair|cadastro|login|buscar|pesquisar|fechar|voltar)$/i,
+    /^(aceitar|cookies|ok|sim|não|próximo|anterior)$/i,
+    /^(facebook|instagram|youtube|twitter|tiktok|whatsapp|telegram)$/i,
+    /^patrocinado$/i,
+    /^sponsored$/i,
+    /^ver mais$/i,
+    /^.{1,12}$/,                                         // too short to be copy
+    /^[^a-záàâãéêíóôõúç]*$/,                            // no Portuguese letters at all
+    /página de facebook/i,
+    /biblioteca de anúncios/i,
+    /relatório da biblioteca/i,
   ];
+
+  // Also skip the advertiser name line if provided
+  if (advertiserName) {
+    const escapedName = advertiserName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    skipPatterns.push(new RegExp(`^${escapedName}$`, 'i'));
+  }
 
   const salesIndicators = [
-    /apenas|por apenas|somente|desconto|oferta|promoção|grátis|bônus/i,
-    /aprenda|descubra|transforme|conquiste|garanta|acesse|baixe/i,
-    /método|técnica|estratégia|passo a passo|guia|manual|curso/i,
-    /resultado|comprovado|garantido|testado|funciona/i,
-    /R\$|\d+\s*(reais|dias|horas|semanas|meses)/i,
-    /clique|acesse|compre|inscreva|cadastre|garanta/i,
+    /apenas|por apenas|somente|desconto|oferta|promoção|grátis|bônus|exclusiv/i,
+    /aprenda|descubra|transforme|conquiste|garanta|acesse|baixe|receba/i,
+    /método|técnica|estratégia|passo a passo|guia|manual|curso|treinamento/i,
+    /resultado|comprovado|garantido|testado|funciona|eficaz/i,
+    /R\$|\d+\s*(reais|dias|horas|semanas|meses|anos)/i,
+    /clique|acesse|compre|inscreva|cadastre|garanta|quero|começar/i,
+    /você|seu|sua|nosso|nossa|aproveite|não perca|última/i,
   ];
 
-  const cleaned: string[] = [];
   const seen = new Set<string>();
+  const cleaned: string[] = [];
 
   for (const line of lines) {
     if (seen.has(line)) continue;
     seen.add(line);
+    if (skipPatterns.some(p => p.test(line))) continue;
 
-    if (ignorePatterns.some(p => p.test(line))) continue;
-
-    // Prioritize lines with sales indicators
     const hasSalesContent = salesIndicators.some(p => p.test(line));
     if (hasSalesContent || line.length > 40) {
       cleaned.push(line);
     }
   }
 
-  return cleaned.slice(0, 20).join('\n');
+  return cleaned.slice(0, 18).join('\n');
 }
+
+// ─── Funnel Crawler ───────────────────────────────────────────────────────────
 
 async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<any[]> {
   const steps: any[] = [];
@@ -215,24 +249,21 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
     try {
       await page.setViewportSize({ width: 1920, height: 1080 });
       await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-
-      // Wait for content to settle
       try { await page.waitForLoadState('networkidle', { timeout: 8000 }); } catch {}
       await delay(2500);
 
       const realUrl = page.url();
       const domain = new URL(realUrl).hostname;
 
-      // High-quality full-page screenshot
       const screenshotPath = `step_${depth + 1}_${Date.now()}.png`;
       await page.screenshot({ path: screenshotPath, fullPage: true });
 
       const pageData = await page.evaluate(() => {
-        // Clean copy: skip nav, footer, aside, hidden elements
         const skip = new Set<Node>();
-        ['nav', 'footer', 'aside', 'header', '[aria-hidden="true"]', '.cookie', '#cookie',
-         '[class*="cookie"]', '[class*="nav"]', '[class*="footer"]', '[class*="menu"]',
-         '[class*="header"]', 'script', 'style', 'noscript'].forEach(sel => {
+        ['nav', 'footer', 'aside', 'header', '[aria-hidden="true"]',
+         '[class*="cookie"]', '[class*="nav"]', '[class*="footer"]',
+         '[class*="menu"]', '[class*="header"]', 'script', 'style', 'noscript',
+        ].forEach(sel => {
           try { document.querySelectorAll(sel).forEach(el => skip.add(el)); } catch {}
         });
 
@@ -242,8 +273,8 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
               let el = node.parentElement;
               while (el) {
                 if (skip.has(el)) return NodeFilter.FILTER_REJECT;
-                const style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return NodeFilter.FILTER_REJECT;
+                const s = window.getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return NodeFilter.FILTER_REJECT;
                 el = el.parentElement;
               }
               return NodeFilter.FILTER_ACCEPT;
@@ -269,8 +300,8 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
           document.querySelector('iframe[src*="panda"]')
         );
 
-        // Try to get actual video source
-        const videoSrc = (document.querySelector('video source') as HTMLSourceElement)?.src ||
+        const videoSrc =
+          (document.querySelector('video source') as HTMLSourceElement)?.src ||
           (document.querySelector('video') as HTMLVideoElement)?.src ||
           (document.querySelector('iframe[src*="youtube"]') as HTMLIFrameElement)?.src ||
           (document.querySelector('iframe[src*="vimeo"]') as HTMLIFrameElement)?.src ||
@@ -281,18 +312,15 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
         const fullText = document.body.innerText || '';
         const lower = fullText.toLowerCase();
 
-        const hasUpsell = lower.includes('leve também') || lower.includes('adicione ao pedido') || lower.includes('aproveite também') || lower.includes('oferta especial');
-        const hasDownsell = lower.includes('espera') && (lower.includes('sair') || lower.includes('chance')) || lower.includes('última chance');
+        const hasUpsell   = lower.includes('leve também') || lower.includes('adicione ao pedido') || lower.includes('aproveite também') || lower.includes('oferta especial');
+        const hasDownsell = (lower.includes('espera') && (lower.includes('sair') || lower.includes('chance'))) || lower.includes('última chance');
         const hasCheckout = lower.includes('checkout') || lower.includes('finalizar compra') || lower.includes('dados do cartão') || lower.includes('cartão de crédito');
-        const isQuiz = radioInputs >= 2 || lower.includes('quiz') || lower.includes('próxima pergunta');
+        const isQuiz      = radioInputs >= 2 || lower.includes('quiz') || lower.includes('próxima pergunta');
         const hasLongCopy = rawText.length > 500;
 
-        const ctaKeywords = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'próximo', 'continuar', 'sim', 'começar', 'inscrever'];
+        const ctaKeywords = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'próximo', 'continuar', 'começar', 'inscrever'];
         const ctaLinks = Array.from(document.querySelectorAll('a, button'))
-          .filter((el: any) => {
-            const t = (el.innerText || '').toLowerCase();
-            return ctaKeywords.some(k => t.includes(k));
-          })
+          .filter((el: any) => { const t = (el.innerText || '').toLowerCase(); return ctaKeywords.some(k => t.includes(k)); })
           .map((el: any) => el.href || null)
           .filter((h: string | null): h is string => !!h && !h.includes('javascript:'));
 
@@ -306,184 +334,168 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
             .filter(Boolean)
         )];
 
-        return {
-          title: document.title,
-          rawText: rawText.substring(0, 3000),
-          hasVideo,
-          videoSrc,
-          radioInputs,
-          hasUpsell,
-          hasDownsell,
-          hasCheckout,
-          isQuiz,
-          hasLongCopy,
-          ctaLinks: ctaLinks.slice(0, 3),
-          waLinks: waLinks.slice(0, 2),
-          subdomains: subdomains.slice(0, 5)
-        };
+        return { title: document.title, rawText: rawText.substring(0, 3000), hasVideo, videoSrc, radioInputs, hasUpsell, hasDownsell, hasCheckout, isQuiz, hasLongCopy, ctaLinks: ctaLinks.slice(0, 3), waLinks: waLinks.slice(0, 2), subdomains: subdomains.slice(0, 5) };
       });
 
-      const pageType = classifyPage(pageData.rawText, pageData.hasVideo, pageData.radioInputs);
+      const pageType  = classifyPage(pageData.rawText, pageData.hasVideo, pageData.radioInputs);
       const cleanCopy = extractSalesCopy(pageData.rawText);
-      const platform = detectPlatform(realUrl, pageData.rawText);
+      const platform  = detectPlatform(realUrl, pageData.rawText);
 
-      steps.push({
-        url: realUrl,
-        domain,
-        type: pageType,
-        title: pageData.title,
-        screenshotPath,
-        videoSrc: pageData.videoSrc,
-        hasVideo: pageData.hasVideo,
-        hasUpsell: pageData.hasUpsell,
-        hasDownsell: pageData.hasDownsell,
-        hasCheckout: pageData.hasCheckout,
-        isQuiz: pageData.isQuiz,
-        hasLongCopy: pageData.hasLongCopy,
-        copy: cleanCopy,
-        subdomains: pageData.subdomains,
-        platform,
-      });
+      steps.push({ url: realUrl, domain, type: pageType, title: pageData.title, screenshotPath, videoSrc: pageData.videoSrc, hasVideo: pageData.hasVideo, hasUpsell: pageData.hasUpsell, hasDownsell: pageData.hasDownsell, hasCheckout: pageData.hasCheckout, isQuiz: pageData.isQuiz, hasLongCopy: pageData.hasLongCopy, copy: cleanCopy, subdomains: pageData.subdomains, platform });
 
       let nextUrl: string | null = null;
-      if (pageData.waLinks.length > 0) nextUrl = pageData.waLinks[0];
+      if (pageData.waLinks.length > 0)  nextUrl = pageData.waLinks[0];
       else if (pageData.ctaLinks.length > 0) nextUrl = pageData.ctaLinks[0];
 
-      if (nextUrl && !visited.has(nextUrl) && !nextUrl.includes('facebook.com')) {
-        currentUrl = nextUrl;
-      } else break;
+      if (nextUrl && !visited.has(nextUrl) && !nextUrl.includes('facebook.com')) currentUrl = nextUrl;
+      else break;
 
       depth++;
-    } catch (err) {
-      break;
-    } finally {
-      await page.close();
-    }
+    } catch { break; }
+    finally { await page.close(); }
   }
   return steps;
 }
 
-async function processAd(context: BrowserContext, adData: any, index: number, keyword: string, country: string, categoryScores: AdScore[]) {
-  const countryName = country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿';
+// ─── Collect + Score a single ad (no Telegram yet) ───────────────────────────
 
+async function collectAd(context: BrowserContext, rawCard: any, keyword: string, country: string): Promise<ScoredAd | null> {
   try {
-    if (!adData) return;
+    if (!rawCard) return null;
+    if (rawCard.text.includes('Biblioteca de Anúncios da Meta') || rawCard.text.length < 30) return null;
 
-    const price = extractPrice(adData.text);
+    const price     = extractPrice(rawCard.text);
     const priceLabel = price ? `R$ ${price.toFixed(2)} ✅` : '💡 Não identificado';
 
     // Download ad creative
     let creativePath: string | null = null;
-    if (adData.videos.length > 0) {
+    let creativeIsVideo = false;
+    if (rawCard.videos.length > 0) {
       const p = `creative_${Date.now()}.mp4`;
-      if (await downloadFile(adData.videos[0], p)) creativePath = p;
-    } else if (adData.images.length > 0) {
+      if (await downloadFile(rawCard.videos[0], p)) { creativePath = p; creativeIsVideo = true; }
+    } else if (rawCard.images.length > 0) {
       const p = `creative_${Date.now()}.jpg`;
-      if (await downloadFile(adData.images[0], p)) creativePath = p;
+      if (await downloadFile(rawCard.images[0], p)) creativePath = p;
     }
 
-    // Get funnel URL from pre-extracted links
-    const funnelUrl: string | null = (adData.ctaLinks && adData.ctaLinks[0]) || adData.links[0] || null;
+    const funnelUrl: string | null = (rawCard.ctaLinks && rawCard.ctaLinks[0]) || rawCard.links[0] || null;
 
-    // Crawl funnel
-    let funnelSteps: any[] = [];
+    let funnelStepData: any[] = [];
     if (funnelUrl && !funnelUrl.includes('facebook.com')) {
-      funnelSteps = await crawlFunnel(context, funnelUrl);
+      funnelStepData = await crawlFunnel(context, funnelUrl);
     }
 
-    // Compute quality signals
-    const hasVSL = funnelSteps.some(s => s.type === 'VSL') || adData.hasVideo;
-    const hasQuiz = funnelSteps.some(s => s.isQuiz);
-    const hasUpsell = funnelSteps.some(s => s.hasUpsell);
-    const hasDownsell = funnelSteps.some(s => s.hasDownsell);
-    const hasCheckout = funnelSteps.some(s => s.hasCheckout);
-    const hasLongCopy = funnelSteps.some(s => s.hasLongCopy) || (adData.text.length > 300);
-    const hasCTA = (adData.ctaLinks?.length > 0) || funnelSteps.length > 0;
-    const isMultiDomain = funnelSteps.length > 0 && new Set(funnelSteps.map(s => s.domain)).size > 1;
+    const hasVSL      = funnelStepData.some(s => s.type === 'VSL') || rawCard.hasVideo;
+    const hasQuiz     = funnelStepData.some(s => s.isQuiz);
+    const hasUpsell   = funnelStepData.some(s => s.hasUpsell);
+    const hasDownsell = funnelStepData.some(s => s.hasDownsell);
+    const hasCheckout = funnelStepData.some(s => s.hasCheckout);
+    const hasLongCopy = funnelStepData.some(s => s.hasLongCopy) || rawCard.text.length > 300;
+    const hasCTA      = (rawCard.ctaLinks?.length > 0) || funnelStepData.length > 0;
 
-    // 0-10 quality score
-    const score = calculateScore({ hasVSL, hasQuiz, hasUpsell, hasDownsell, funnelSteps: funnelSteps.length, hasCTA, hasCheckout, hasLongCopy });
+    const score     = calculateScore({ hasVSL, hasQuiz, hasUpsell, hasDownsell, funnelSteps: funnelStepData.length, hasCTA, hasCheckout, hasLongCopy });
+    const domains   = [...new Set(funnelStepData.map((s: any) => s.domain))] as string[];
+    const platform  = funnelStepData.length > 0 ? (funnelStepData[0].platform || 'Direto') : detectPlatform(funnelUrl || '', rawCard.text);
+    const funnelType = funnelStepData.length > 0 ? funnelStepData.map((s: any) => s.type).join(' → ') : 'Direto';
 
-    const daysRunning = adData.dateText ? 30 : 0;
-    categoryScores.push({ advertiser: adData.advertiser, keyword, score, price: priceLabel, creativeType: adData.hasVideo ? '🎥 Vídeo' : '🖼 Imagem', daysRunning, hasUpsell, hasDownsell, hasVSL, hasQuiz, funnelUrl: funnelUrl || 'N/A' });
+    // Clean copy — strip advertiser ID/name from card text
+    const cleanCopy = extractSalesCopy(rawCard.text, rawCard.advertiser);
 
-    // FILTER: only send high-quality ads to Telegram
-    if (score < MIN_QUALITY_SCORE) {
-      console.log(`[SKIP] Score ${score}/10 < ${MIN_QUALITY_SCORE} — ${adData.advertiser}`);
-      return;
-    }
-
-    // Detect platform and domains
-    const domains = [...new Set(funnelSteps.map(s => s.domain))];
-    const platform = funnelSteps.length > 0 ? (funnelSteps[0].platform || 'Direto') : 'N/A';
-    const funnelType = funnelSteps.length > 0 ? funnelSteps.map(s => s.type).join(' → ') : 'Direto';
-
-    // Send header
-    await sendToTelegram(`🎯 <b>OFERTA ${index + 1} | ${keyword} | ${countryName}</b>`);
-
-    // Send ad creative
-    if (creativePath) {
-      if (adData.hasVideo) await sendVideo(creativePath, `🎥 ${adData.advertiser}`);
-      else await sendPhoto(creativePath, `🖼 ${adData.advertiser}`);
-    }
-
-    // Build clean ad copy (no nav noise)
-    const cleanAdCopy = extractSalesCopy(adData.text);
-
-    // Full funnel intelligence report
-    await sendToTelegram(`
-⭐ <b>SCORE: ${score}/10</b>
-🏢 <b>Anunciante:</b> ${adData.advertiser}
-💰 <b>Preço:</b> ${priceLabel}
-🎨 <b>Criativo:</b> ${adData.hasVideo ? '🎥 Vídeo/VSL' : '🖼 Imagem'}
-🏪 <b>Plataforma:</b> ${platform}
-📅 <b>Data início:</b> ${adData.dateText || 'Desconhecida'}
-
-📊 <b>FUNIL (${funnelSteps.length} etapas):</b> ${funnelType}
-🎬 VSL: ${hasVSL ? '✅' : '❌'} | 🧩 Quiz: ${hasQuiz ? '✅' : '❌'}
-⬆️ Upsell: ${hasUpsell ? '✅' : '❌'} | ⬇️ Downsell: ${hasDownsell ? '✅' : '❌'}
-🛒 Checkout: ${hasCheckout ? '✅' : '❌'} | 📝 Copy longa: ${hasLongCopy ? '✅' : '❌'}
-🌐 Domínios: ${domains.length > 0 ? domains.join(', ') : 'N/A'}
-
-📝 <b>COPY DO ANÚNCIO:</b>
-${cleanAdCopy.substring(0, 400)}
-
-🔗 <b>Funil:</b> ${funnelUrl || 'N/A'}`);
-
-    // Send funnel screenshots + VSL video + clean copy for each step
-    for (let i = 0; i < funnelSteps.length; i++) {
-      const step = funnelSteps[i];
-
-      // If VSL — try to download and send the actual video file
-      if (step.type === 'VSL' && step.videoSrc && step.videoSrc.startsWith('http')) {
-        const ext = step.videoSrc.includes('.mp4') ? 'mp4' : 'mp4';
-        const vslPath = `vsl_${Date.now()}.${ext}`;
-        const downloaded = await downloadFile(step.videoSrc, vslPath);
-        if (downloaded && fs.existsSync(vslPath)) {
-          await sendVideo(vslPath, `🎬 VSL — Etapa ${i + 1} | ${step.domain}`);
-        } else {
-          // Fallback to screenshot
-          if (step.screenshotPath) await sendPhoto(step.screenshotPath, `📸 VSL — Etapa ${i + 1} | ${step.domain}`);
-        }
-      } else {
-        if (step.screenshotPath) await sendPhoto(step.screenshotPath, `📸 Etapa ${i + 1} — ${step.type} | ${step.domain}`);
-      }
-
-      // Send clean page copy (first step only to avoid spam)
-      if (step.copy && step.copy.length > 30 && i === 0) {
-        await sendToTelegram(`📝 <b>COPY DA PÁGINA (${step.type}):</b>\n${step.copy.substring(0, 600)}`);
-      }
-    }
-
-    await sendToTelegram('━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    await delay(2000);
-
+    return {
+      advertiser: rawCard.advertiser,
+      keyword,
+      country,
+      score,
+      price: priceLabel,
+      creativeType: rawCard.hasVideo ? '🎥 Vídeo' : '🖼 Imagem',
+      dateText: rawCard.dateText,
+      hasVSL,
+      hasQuiz,
+      hasUpsell,
+      hasDownsell,
+      hasCheckout,
+      hasLongCopy,
+      funnelSteps: funnelStepData.length,
+      funnelType,
+      domains,
+      platform,
+      funnelUrl: funnelUrl || 'N/A',
+      cleanCopy,
+      creativePath,
+      creativeIsVideo,
+      funnelStepData,
+    };
   } catch (err) {
-    console.error(`Erro anúncio ${index}:`, err);
+    console.error('collectAd error:', err);
+    return null;
   }
 }
 
-async function scrapeKeyword(keyword: string, country: string, context: BrowserContext, page: Page, categoryScores: AdScore[]) {
+// ─── Send a single scored ad to Telegram ──────────────────────────────────────
+
+async function sendAdReport(ad: ScoredAd, rank: number, isBestToClone: boolean) {
+  const countryName = ad.country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿';
+  const cloneTag    = isBestToClone ? '\n\n🏆 <b>MELHOR OPÇÃO PARA CLONAR</b>' : '';
+
+  // 1. Creative (image or video)
+  if (ad.creativePath) {
+    const creativeCaption = `${isBestToClone ? '🏆 ' : ''}#${rank} | ${ad.advertiser} | ${ad.keyword}`;
+    if (ad.creativeIsVideo) await sendVideo(ad.creativePath, creativeCaption);
+    else                    await sendPhoto(ad.creativePath, creativeCaption);
+  }
+
+  // 2. Main report card
+  await sendToTelegram(`\
+🎯 <b>#${rank} | ${ad.keyword} | ${countryName}</b>${cloneTag}
+
+⭐ <b>Score: ${ad.score}/10</b>
+🏢 <b>Anunciante:</b> ${ad.advertiser}
+💰 <b>Preço:</b> ${ad.price}
+🎨 <b>Criativo:</b> ${ad.creativeType}
+🏪 <b>Plataforma:</b> ${ad.platform}
+📅 <b>Data início:</b> ${ad.dateText || 'Desconhecida'}
+
+📊 <b>Funil (${ad.funnelSteps} etapas):</b> ${ad.funnelType}
+🎬 VSL: ${ad.hasVSL ? '✅' : '❌'} | 🧩 Quiz: ${ad.hasQuiz ? '✅' : '❌'}
+⬆️ Upsell: ${ad.hasUpsell ? '✅' : '❌'} | ⬇️ Downsell: ${ad.hasDownsell ? '✅' : '❌'}
+🛒 Checkout: ${ad.hasCheckout ? '✅' : '❌'} | 📝 Copy longa: ${ad.hasLongCopy ? '✅' : '❌'}
+🌐 <b>Domínios:</b> ${ad.domains.length > 0 ? ad.domains.join(', ') : 'N/A'}
+🔗 <b>Funil:</b> ${ad.funnelUrl}`);
+
+  // 3. Ad copy (clean)
+  if (ad.cleanCopy.length > 20) {
+    await sendToTelegram(`📝 <b>COPY DO ANÚNCIO:</b>\n${ad.cleanCopy.substring(0, 600)}`);
+  }
+
+  // 4. Funnel step screenshots + VSL video + page copy
+  for (let i = 0; i < ad.funnelStepData.length; i++) {
+    const step = ad.funnelStepData[i];
+
+    if (step.type === 'VSL' && step.videoSrc && step.videoSrc.startsWith('http')) {
+      const vslPath = `vsl_${Date.now()}.mp4`;
+      const ok = await downloadFile(step.videoSrc, vslPath);
+      if (ok && fs.existsSync(vslPath)) {
+        await sendVideo(vslPath, `🎬 VSL — Etapa ${i + 1} | ${step.domain}`);
+      } else {
+        if (step.screenshotPath) await sendPhoto(step.screenshotPath, `📸 VSL — Etapa ${i + 1} | ${step.domain}`);
+      }
+    } else {
+      if (step.screenshotPath) await sendPhoto(step.screenshotPath, `📸 Etapa ${i + 1} — ${step.type} | ${step.domain}`);
+    }
+
+    // Send page copy for first step only
+    if (i === 0 && step.copy && step.copy.length > 30) {
+      await sendToTelegram(`📝 <b>COPY DA PÁGINA (${step.type}):</b>\n${step.copy.substring(0, 600)}`);
+    }
+  }
+
+  await sendToTelegram('━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  await delay(1500);
+}
+
+// ─── Scrape one keyword: collect all → rank → send top N ─────────────────────
+
+async function scrapeKeyword(keyword: string, country: string, context: BrowserContext, page: Page) {
   const countryName = country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿';
   const searchUrl = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=${country}&q=${encodeURIComponent(keyword)}&search_type=keyword_unordered`;
 
@@ -494,11 +506,12 @@ async function scrapeKeyword(keyword: string, country: string, context: BrowserC
     await page.evaluate(() => window.scrollBy(0, 800));
     await delay(3000);
 
+    // Screenshot of the results page
     const libScreenshot = `lib_${Date.now()}.png`;
     await page.screenshot({ path: libScreenshot });
     await sendPhoto(libScreenshot, `🔍 ${keyword} — ${countryName}`);
 
-    // Use Playwright's exact text locator to find "Patrocinado" labels inside actual ad cards
+    // Locate ad cards via "Patrocinado" label
     const sponsoredLocator = page.getByText('Patrocinado', { exact: true });
     let count = 0;
     try {
@@ -517,16 +530,16 @@ async function scrapeKeyword(keyword: string, country: string, context: BrowserC
       return;
     }
 
-    await sendToTelegram(`✅ <b>${count} anúncios encontrados</b> (filtrando score ≥ ${MIN_QUALITY_SCORE}/10)`);
+    await sendToTelegram(`⏳ <b>${count} anúncios encontrados.</b> Analisando e rankeando...`);
 
+    // ── Step 1: extract raw card data from the page ──────────────────────────
+    const rawCards: any[] = [];
     for (let i = 0; i < count; i++) {
       try {
         const sponsoredEl = sponsoredLocator.nth(i);
-
-        // XPath: closest ancestor div with an a[role="link"] inside = the ad card
         const cardLocator = sponsoredEl.locator('xpath=ancestor::div[.//a[@role="link"]][1]');
 
-        const adData = await cardLocator.evaluate((cardEl: HTMLElement) => {
+        const raw = await cardLocator.evaluate((cardEl: HTMLElement) => {
           function extractRealUrl(href: string): string | null {
             if (!href) return null;
             if (href.includes('l.facebook.com/l.php') || href.includes('lm.facebook.com')) {
@@ -536,17 +549,25 @@ async function scrapeKeyword(keyword: string, country: string, context: BrowserC
               } catch {}
               return null;
             }
-            if (
-              href.startsWith('http') &&
-              !href.includes('facebook.com') &&
-              !href.includes('fb.com') &&
-              !href.includes('fb.me') &&
-              !href.includes('instagram.com')
-            ) return href;
+            if (href.startsWith('http') && !href.includes('facebook.com') && !href.includes('fb.com') && !href.includes('fb.me') && !href.includes('instagram.com')) return href;
             return null;
           }
 
-          const text = cardEl.innerText || '';
+          const advertiserEl = cardEl.querySelector('a[role="link"]') as HTMLElement | null;
+          const advertiser = advertiserEl?.innerText?.trim() || 'Desconhecido';
+
+          // Get text EXCLUDING the advertiser name element to avoid ID bleed
+          let text = '';
+          cardEl.childNodes.forEach(node => {
+            if (node !== advertiserEl && !(node as HTMLElement).contains?.(advertiserEl)) {
+              text += (node as HTMLElement).innerText || (node.textContent || '');
+            }
+          });
+          // Fallback: use all innerText but strip the advertiser name from start
+          if (!text.trim()) {
+            text = cardEl.innerText || '';
+            if (advertiser && text.startsWith(advertiser)) text = text.slice(advertiser.length);
+          }
 
           const images = Array.from(cardEl.querySelectorAll('img'))
             .map((img: any) => img.src as string)
@@ -556,16 +577,9 @@ async function scrapeKeyword(keyword: string, country: string, context: BrowserC
             .map((v: any) => v.src as string)
             .filter(Boolean);
 
-          const advertiserEl = cardEl.querySelector('a[role="link"]') as HTMLElement | null;
-          const advertiser = advertiserEl?.innerText?.trim() || 'Desconhecido';
-
           const ctaKeywords = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'continuar', 'começar', 'ver mais', 'obter', 'inscrever', 'assinar'];
-
           const ctaLinks = Array.from(cardEl.querySelectorAll('a'))
-            .filter((a: any) => {
-              const t = (a.innerText || '').toLowerCase();
-              return ctaKeywords.some(k => t.includes(k));
-            })
+            .filter((a: any) => { const t = (a.innerText || '').toLowerCase(); return ctaKeywords.some(k => t.includes(k)); })
             .map((a: any) => extractRealUrl(a.href))
             .filter((h: string | null): h is string => h !== null);
 
@@ -592,38 +606,55 @@ async function scrapeKeyword(keyword: string, country: string, context: BrowserC
           };
         });
 
-        // Skip nav/header content
-        if (
-          adData.text.includes('Biblioteca de Anúncios da Meta') ||
-          adData.text.includes('Relatório da Biblioteca') ||
-          adData.text.includes('Sobre a Biblioteca') ||
-          adData.text.length < 30
-        ) continue;
-
-        await processAd(context, adData, i, keyword, country, categoryScores);
-        await delay(3000);
+        rawCards.push(raw);
       } catch (err) {
-        console.error(`Erro ao processar anúncio ${i}:`, err);
+        console.error(`Erro ao ler card ${i}:`, err);
       }
     }
 
-    await sendToTelegram(`✅ <b>CONCLUÍDO:</b> ${keyword} — ${count} anúncios analisados`);
+    // ── Step 2: crawl each funnel + score ────────────────────────────────────
+    const scored: ScoredAd[] = [];
+    for (const raw of rawCards) {
+      const result = await collectAd(context, raw, keyword, country);
+      if (result) scored.push(result);
+      await delay(1500);
+    }
+
+    if (scored.length === 0) {
+      await sendToTelegram(`⚠️ Nenhum anúncio válido para <b>${keyword}</b>`);
+      return;
+    }
+
+    // ── Step 3: rank by score descending, take top N ─────────────────────────
+    scored.sort((a, b) => b.score - a.score);
+    const topAds = scored.slice(0, MAX_SEND_PER_KEYWORD);
+
+    await sendToTelegram(`📊 <b>RANKING — ${keyword} | ${countryName}</b>\n${topAds.map((a, i) => `${i + 1}. ${a.advertiser} — Score: ${a.score}/10`).join('\n')}\n\n🏆 Melhor para clonar: <b>${topAds[0].advertiser}</b>`);
+
+    // ── Step 4: send each ad report ──────────────────────────────────────────
+    for (let i = 0; i < topAds.length; i++) {
+      await sendAdReport(topAds[i], i + 1, i === 0);
+    }
+
+    await sendToTelegram(`✅ <b>CONCLUÍDO:</b> ${keyword} — ${topAds.length} ads enviados (${scored.length} analisados)`);
 
   } catch (err) {
     console.error(`Erro keyword "${keyword}":`, err);
   }
 }
 
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
 async function main() {
   const browser = await chromium.launch({
     headless: true,
     executablePath: process.env.REPLIT_PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
   });
-  await sendToTelegram(`🚀 <b>Agente v2 iniciado!</b>\n🌍 Brasil 🇧🇷 e Moçambique 🇲🇿\n💰 Faixa: R$9,99 — R$50\n⭐ Filtro: Score ≥ ${MIN_QUALITY_SCORE}/10`);
+
+  await sendToTelegram(`🚀 <b>Agente v3 iniciado!</b>\n🌍 Brasil 🇧🇷 + Moçambique 🇲🇿\n💡 Lógica: coleta todos os ads → ranqueia → envia Top ${MAX_SEND_PER_KEYWORD} por keyword`);
 
   for (const country of COUNTRIES) {
     for (const [category, keywords] of Object.entries(KEYWORD_CATEGORIES)) {
-      const categoryScores: AdScore[] = [];
       await sendToTelegram(`\n📂 <b>CATEGORIA: ${category}</b> | ${country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿'}`);
 
       const context = await browser.newContext({
@@ -634,23 +665,8 @@ async function main() {
       const page = await context.newPage();
 
       for (const keyword of keywords) {
-        await scrapeKeyword(keyword, country, context, page, categoryScores);
+        await scrapeKeyword(keyword, country, context, page);
         await delay(4000);
-      }
-
-      // Top 10 da categoria — only scored ads
-      const highQuality = categoryScores.filter(a => a.score >= MIN_QUALITY_SCORE);
-      if (highQuality.length > 0) {
-        const top10 = highQuality.sort((a, b) => b.score - a.score).slice(0, 10);
-        let summary = `🏆 <b>TOP ${top10.length} MELHORES — ${category.toUpperCase()}</b>\n\n`;
-        top10.forEach((ad, i) => {
-          summary += `${i + 1}. <b>${ad.advertiser}</b>\n`;
-          summary += `   ⭐ Score: ${ad.score}/10 | 💰 ${ad.price}\n`;
-          summary += `   🎬 VSL: ${ad.hasVSL ? '✅' : '❌'} | ⬆️ ${ad.hasUpsell ? 'Upsell ✅' : ''} ${ad.hasDownsell ? 'Downsell ✅' : ''}\n`;
-          summary += `   🔗 ${ad.funnelUrl !== 'N/A' ? ad.funnelUrl.substring(0, 60) : 'N/A'}\n\n`;
-        });
-        summary += `\n💡 <b>Recomendação:</b> Clonar ofertas 1 e 2`;
-        await sendToTelegram(summary);
       }
 
       await context.close();
