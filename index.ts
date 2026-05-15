@@ -26,6 +26,7 @@ const KEYWORD_CATEGORIES: { [key: string]: string[] } = {
 
 const COUNTRIES = ['BR', 'MZ'];
 const MAX_ADS_PER_KEYWORD = 10;
+const MIN_QUALITY_SCORE = 7;
 
 interface AdScore {
   advertiser: string;
@@ -77,10 +78,18 @@ function downloadFile(url: string, dest: string): Promise<boolean> {
   return new Promise((resolve) => {
     const file = fs.createWriteStream(dest);
     const protocol = url.startsWith('https') ? https : http;
-    protocol.get(url, (response) => {
+    const req = protocol.get(url, (response) => {
+      if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        file.close();
+        fs.unlink(dest, () => {});
+        downloadFile(response.headers.location!, dest).then(resolve);
+        return;
+      }
       response.pipe(file);
       file.on('finish', () => { file.close(); resolve(true); });
-    }).on('error', () => { fs.unlink(dest, () => {}); resolve(false); });
+    });
+    req.on('error', () => { fs.unlink(dest, () => {}); resolve(false); });
+    req.setTimeout(30000, () => { req.destroy(); fs.unlink(dest, () => {}); resolve(false); });
   });
 }
 
@@ -102,26 +111,96 @@ function extractPrice(text: string): number | null {
   return null;
 }
 
-function calculateScore(data: any): number {
+// 0-10 quality score
+function calculateScore(data: {
+  hasVSL: boolean;
+  hasQuiz: boolean;
+  hasUpsell: boolean;
+  hasDownsell: boolean;
+  funnelSteps: number;
+  hasCTA: boolean;
+  hasCheckout: boolean;
+  hasLongCopy: boolean;
+}): number {
   let score = 0;
-  if (data.daysRunning > 30) score += 30;
-  if (data.hasVSL) score += 20;
-  if (data.hasUpsell || data.hasDownsell) score += 20;
-  if (data.price) score += 15;
-  if (data.hasQuiz) score += 10;
-  if (data.isMultiDomain) score += 5;
-  return score;
+  if (data.hasVSL) score += 2;
+  if (data.hasQuiz) score += 2;
+  if (data.hasUpsell || data.hasDownsell) score += 2;
+  if (data.funnelSteps > 1) score += 1;
+  if (data.hasCTA) score += 1;
+  if (data.hasCheckout) score += 1;
+  if (data.hasLongCopy) score += 1;
+  return Math.min(score, 10);
+}
+
+function detectPlatform(url: string, text: string): string {
+  if (url.includes('hotmart.com') || url.includes('hotmart.product')) return 'Hotmart';
+  if (url.includes('kiwify.com.br') || url.includes('kiwify.app')) return 'Kiwify';
+  if (url.includes('eduzz.com') || url.includes('sun.eduzz.com')) return 'Eduzz';
+  if (url.includes('monetizze.com.br')) return 'Monetizze';
+  if (url.includes('pepper.com.br')) return 'Pepper';
+  if (url.includes('braip.com')) return 'Braip';
+  if (url.includes('pay.') || url.includes('/checkout')) return 'Checkout';
+  if (url.includes('wa.me') || url.includes('whatsapp')) return 'WhatsApp';
+  if (text.toLowerCase().includes('hotmart')) return 'Hotmart';
+  if (text.toLowerCase().includes('kiwify')) return 'Kiwify';
+  return 'Direto';
 }
 
 function classifyPage(text: string, hasVideo: boolean, radioInputs: number): string {
   const lower = text.toLowerCase();
+  if (hasVideo && (lower.includes('assista') || lower.includes('vídeo') || lower.includes('video') || lower.includes('assista até o fim'))) return 'VSL';
   if (hasVideo) return 'VSL';
   if (radioInputs >= 2 || lower.includes('quiz') || lower.includes('próxima pergunta')) return 'QUIZ';
-  if (lower.includes('checkout') || lower.includes('finalizar compra')) return 'CHECKOUT';
-  if (lower.includes('upsell') || lower.includes('leve também')) return 'UPSELL';
-  if (lower.includes('espera') || lower.includes('antes de sair')) return 'DOWNSELL';
+  if (lower.includes('checkout') || lower.includes('finalizar compra') || lower.includes('dados do cartão')) return 'CHECKOUT';
+  if (lower.includes('upsell') || lower.includes('leve também') || lower.includes('adicione ao pedido')) return 'UPSELL';
+  if (lower.includes('espera') || lower.includes('antes de sair') || lower.includes('última chance')) return 'DOWNSELL';
   if (lower.includes('whatsapp') || lower.includes('wa.me')) return 'WHATSAPP';
   return 'LANDING';
+}
+
+// Extract clean sales copy, ignoring nav/footer/UI noise
+function extractSalesCopy(rawText: string): string {
+  const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+
+  const ignorePatterns = [
+    /^(ac|al|am|ap|ba|ce|df|es|go|ma|mg|ms|mt|pa|pb|pe|pi|pr|rj|rn|ro|rr|rs|sc|se|sp|to)$/i,
+    /^[a-záàâãéêíóôõúç]{2,20}(,\s*[a-záàâãéêíóôõúç]{2,20}){2,}$/i,
+    /^(home|menu|início|sobre|contato|política|privacidade|termos|copyright|todos os direitos|©|\d{4})/i,
+    /^(carrinho|minha conta|entrar|sair|cadastro|login|buscar|pesquisar)$/i,
+    /^(aceitar cookies|cookies|fechar|ok|sim|não|voltar|próximo|anterior)$/i,
+    /^(facebook|instagram|youtube|twitter|tiktok|whatsapp)$/i,
+    /^.{1,15}$/, // very short fragments
+    /^(\d+)$/, // pure numbers
+    /^[^a-záàâãéêíóôõúç]*$/, // no actual words
+  ];
+
+  const salesIndicators = [
+    /apenas|por apenas|somente|desconto|oferta|promoção|grátis|bônus/i,
+    /aprenda|descubra|transforme|conquiste|garanta|acesse|baixe/i,
+    /método|técnica|estratégia|passo a passo|guia|manual|curso/i,
+    /resultado|comprovado|garantido|testado|funciona/i,
+    /R\$|\d+\s*(reais|dias|horas|semanas|meses)/i,
+    /clique|acesse|compre|inscreva|cadastre|garanta/i,
+  ];
+
+  const cleaned: string[] = [];
+  const seen = new Set<string>();
+
+  for (const line of lines) {
+    if (seen.has(line)) continue;
+    seen.add(line);
+
+    if (ignorePatterns.some(p => p.test(line))) continue;
+
+    // Prioritize lines with sales indicators
+    const hasSalesContent = salesIndicators.some(p => p.test(line));
+    if (hasSalesContent || line.length > 40) {
+      cleaned.push(line);
+    }
+  }
+
+  return cleaned.slice(0, 20).join('\n');
 }
 
 async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<any[]> {
@@ -134,33 +213,137 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
     visited.add(currentUrl);
     const page = await context.newPage();
     try {
-      await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-      await delay(2000);
+      await page.setViewportSize({ width: 1920, height: 1080 });
+      await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+
+      // Wait for content to settle
+      try { await page.waitForLoadState('networkidle', { timeout: 8000 }); } catch {}
+      await delay(2500);
 
       const realUrl = page.url();
       const domain = new URL(realUrl).hostname;
+
+      // High-quality full-page screenshot
       const screenshotPath = `step_${depth + 1}_${Date.now()}.png`;
-      await page.screenshot({ path: screenshotPath, fullPage: false });
+      await page.screenshot({ path: screenshotPath, fullPage: true });
 
       const pageData = await page.evaluate(() => {
-        const text = document.body.innerText || '';
-        const hasVideo = !!(document.querySelector('video') || document.querySelector('iframe[src*="youtube"]') || document.querySelector('iframe[src*="vimeo"]'));
-        const videoUrl = (document.querySelector('iframe[src*="youtube"]') as HTMLIFrameElement)?.src || (document.querySelector('video') as HTMLVideoElement)?.src || null;
+        // Clean copy: skip nav, footer, aside, hidden elements
+        const skip = new Set<Node>();
+        ['nav', 'footer', 'aside', 'header', '[aria-hidden="true"]', '.cookie', '#cookie',
+         '[class*="cookie"]', '[class*="nav"]', '[class*="footer"]', '[class*="menu"]',
+         '[class*="header"]', 'script', 'style', 'noscript'].forEach(sel => {
+          try { document.querySelectorAll(sel).forEach(el => skip.add(el)); } catch {}
+        });
+
+        function getVisibleText(root: Element): string {
+          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+              let el = node.parentElement;
+              while (el) {
+                if (skip.has(el)) return NodeFilter.FILTER_REJECT;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return NodeFilter.FILTER_REJECT;
+                el = el.parentElement;
+              }
+              return NodeFilter.FILTER_ACCEPT;
+            }
+          });
+          const parts: string[] = [];
+          let node: Node | null;
+          while ((node = walker.nextNode())) {
+            const t = (node.textContent || '').trim();
+            if (t.length > 2) parts.push(t);
+          }
+          return parts.join('\n');
+        }
+
+        const mainEl = document.querySelector('main, article, [role="main"], .main, #main, section') || document.body;
+        const rawText = getVisibleText(mainEl as Element);
+
+        const hasVideo = !!(
+          document.querySelector('video') ||
+          document.querySelector('iframe[src*="youtube"]') ||
+          document.querySelector('iframe[src*="vimeo"]') ||
+          document.querySelector('iframe[src*="wistia"]') ||
+          document.querySelector('iframe[src*="panda"]')
+        );
+
+        // Try to get actual video source
+        const videoSrc = (document.querySelector('video source') as HTMLSourceElement)?.src ||
+          (document.querySelector('video') as HTMLVideoElement)?.src ||
+          (document.querySelector('iframe[src*="youtube"]') as HTMLIFrameElement)?.src ||
+          (document.querySelector('iframe[src*="vimeo"]') as HTMLIFrameElement)?.src ||
+          (document.querySelector('iframe[src*="wistia"]') as HTMLIFrameElement)?.src ||
+          (document.querySelector('iframe[src*="panda"]') as HTMLIFrameElement)?.src || null;
+
         const radioInputs = document.querySelectorAll('input[type="radio"]').length;
-        const hasUpsell = text.toLowerCase().includes('leve também') || text.toLowerCase().includes('adicione ao pedido') || text.toLowerCase().includes('aproveite também');
-        const hasDownsell = text.toLowerCase().includes('espera') || text.toLowerCase().includes('antes de sair') || text.toLowerCase().includes('última chance');
-        const isQuiz = radioInputs >= 2 || text.toLowerCase().includes('quiz');
-        const ctaLinks = Array.from(document.querySelectorAll('a, button')).filter((el: any) => {
-          const t = (el.innerText || '').toLowerCase();
-          return ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'próximo', 'continuar', 'sim', 'começar'].some(k => t.includes(k));
-        }).map((el: any) => el.href || null).filter(Boolean);
-        const waLinks = Array.from(document.querySelectorAll('a')).map((a: any) => a.href).filter((h: string) => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
-        const subdomains = [...new Set(Array.from(document.querySelectorAll('a')).map((a: any) => { try { return new URL(a.href).hostname; } catch { return ''; } }).filter(Boolean))];
-        return { title: document.title, text: text.substring(0, 2000), hasVideo, videoUrl, radioInputs, hasUpsell, hasDownsell, isQuiz, ctaLinks: ctaLinks.slice(0, 3), waLinks: waLinks.slice(0, 2), subdomains: subdomains.slice(0, 5) };
+        const fullText = document.body.innerText || '';
+        const lower = fullText.toLowerCase();
+
+        const hasUpsell = lower.includes('leve também') || lower.includes('adicione ao pedido') || lower.includes('aproveite também') || lower.includes('oferta especial');
+        const hasDownsell = lower.includes('espera') && (lower.includes('sair') || lower.includes('chance')) || lower.includes('última chance');
+        const hasCheckout = lower.includes('checkout') || lower.includes('finalizar compra') || lower.includes('dados do cartão') || lower.includes('cartão de crédito');
+        const isQuiz = radioInputs >= 2 || lower.includes('quiz') || lower.includes('próxima pergunta');
+        const hasLongCopy = rawText.length > 500;
+
+        const ctaKeywords = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'próximo', 'continuar', 'sim', 'começar', 'inscrever'];
+        const ctaLinks = Array.from(document.querySelectorAll('a, button'))
+          .filter((el: any) => {
+            const t = (el.innerText || '').toLowerCase();
+            return ctaKeywords.some(k => t.includes(k));
+          })
+          .map((el: any) => el.href || null)
+          .filter((h: string | null): h is string => !!h && !h.includes('javascript:'));
+
+        const waLinks = Array.from(document.querySelectorAll('a'))
+          .map((a: any) => a.href as string)
+          .filter((h: string) => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
+
+        const subdomains = [...new Set(
+          Array.from(document.querySelectorAll('a'))
+            .map((a: any) => { try { return new URL(a.href).hostname; } catch { return ''; } })
+            .filter(Boolean)
+        )];
+
+        return {
+          title: document.title,
+          rawText: rawText.substring(0, 3000),
+          hasVideo,
+          videoSrc,
+          radioInputs,
+          hasUpsell,
+          hasDownsell,
+          hasCheckout,
+          isQuiz,
+          hasLongCopy,
+          ctaLinks: ctaLinks.slice(0, 3),
+          waLinks: waLinks.slice(0, 2),
+          subdomains: subdomains.slice(0, 5)
+        };
       });
 
-      const pageType = classifyPage(pageData.text, pageData.hasVideo, pageData.radioInputs);
-      steps.push({ url: realUrl, domain, type: pageType, title: pageData.title, screenshotPath, videoUrl: pageData.videoUrl, hasUpsell: pageData.hasUpsell, hasDownsell: pageData.hasDownsell, isQuiz: pageData.isQuiz, copy: pageData.text.substring(0, 800), subdomains: pageData.subdomains });
+      const pageType = classifyPage(pageData.rawText, pageData.hasVideo, pageData.radioInputs);
+      const cleanCopy = extractSalesCopy(pageData.rawText);
+      const platform = detectPlatform(realUrl, pageData.rawText);
+
+      steps.push({
+        url: realUrl,
+        domain,
+        type: pageType,
+        title: pageData.title,
+        screenshotPath,
+        videoSrc: pageData.videoSrc,
+        hasVideo: pageData.hasVideo,
+        hasUpsell: pageData.hasUpsell,
+        hasDownsell: pageData.hasDownsell,
+        hasCheckout: pageData.hasCheckout,
+        isQuiz: pageData.isQuiz,
+        hasLongCopy: pageData.hasLongCopy,
+        copy: cleanCopy,
+        subdomains: pageData.subdomains,
+        platform,
+      });
 
       let nextUrl: string | null = null;
       if (pageData.waLinks.length > 0) nextUrl = pageData.waLinks[0];
@@ -189,7 +372,7 @@ async function processAd(context: BrowserContext, adData: any, index: number, ke
     const price = extractPrice(adData.text);
     const priceLabel = price ? `R$ ${price.toFixed(2)} ✅` : '💡 Não identificado';
 
-    // Download criativo
+    // Download ad creative
     let creativePath: string | null = null;
     if (adData.videos.length > 0) {
       const p = `creative_${Date.now()}.mp4`;
@@ -199,65 +382,99 @@ async function processAd(context: BrowserContext, adData: any, index: number, ke
       if (await downloadFile(adData.images[0], p)) creativePath = p;
     }
 
-    // Obter URL do funil a partir dos links extraídos (sem facebook.com)
+    // Get funnel URL from pre-extracted links
     const funnelUrl: string | null = (adData.ctaLinks && adData.ctaLinks[0]) || adData.links[0] || null;
 
-    // Analisar funil
+    // Crawl funnel
     let funnelSteps: any[] = [];
-    let funnelReport = '';
     if (funnelUrl && !funnelUrl.includes('facebook.com')) {
       funnelSteps = await crawlFunnel(context, funnelUrl);
     }
 
-    // Score
-    const daysRunning = adData.dateText ? 30 : 0;
+    // Compute quality signals
     const hasVSL = funnelSteps.some(s => s.type === 'VSL') || adData.hasVideo;
+    const hasQuiz = funnelSteps.some(s => s.isQuiz);
     const hasUpsell = funnelSteps.some(s => s.hasUpsell);
     const hasDownsell = funnelSteps.some(s => s.hasDownsell);
-    const hasQuiz = funnelSteps.some(s => s.isQuiz);
+    const hasCheckout = funnelSteps.some(s => s.hasCheckout);
+    const hasLongCopy = funnelSteps.some(s => s.hasLongCopy) || (adData.text.length > 300);
+    const hasCTA = (adData.ctaLinks?.length > 0) || funnelSteps.length > 0;
     const isMultiDomain = funnelSteps.length > 0 && new Set(funnelSteps.map(s => s.domain)).size > 1;
 
-    const score = calculateScore({ daysRunning, hasVSL, hasUpsell, hasDownsell, price, hasQuiz, isMultiDomain });
+    // 0-10 quality score
+    const score = calculateScore({ hasVSL, hasQuiz, hasUpsell, hasDownsell, funnelSteps: funnelSteps.length, hasCTA, hasCheckout, hasLongCopy });
 
+    const daysRunning = adData.dateText ? 30 : 0;
     categoryScores.push({ advertiser: adData.advertiser, keyword, score, price: priceLabel, creativeType: adData.hasVideo ? '🎥 Vídeo' : '🖼 Imagem', daysRunning, hasUpsell, hasDownsell, hasVSL, hasQuiz, funnelUrl: funnelUrl || 'N/A' });
 
-    // Enviar header
+    // FILTER: only send high-quality ads to Telegram
+    if (score < MIN_QUALITY_SCORE) {
+      console.log(`[SKIP] Score ${score}/10 < ${MIN_QUALITY_SCORE} — ${adData.advertiser}`);
+      return;
+    }
+
+    // Detect platform and domains
+    const domains = [...new Set(funnelSteps.map(s => s.domain))];
+    const platform = funnelSteps.length > 0 ? (funnelSteps[0].platform || 'Direto') : 'N/A';
+    const funnelType = funnelSteps.length > 0 ? funnelSteps.map(s => s.type).join(' → ') : 'Direto';
+
+    // Send header
     await sendToTelegram(`🎯 <b>OFERTA ${index + 1} | ${keyword} | ${countryName}</b>`);
 
-    // Enviar criativo
+    // Send ad creative
     if (creativePath) {
       if (adData.hasVideo) await sendVideo(creativePath, `🎥 ${adData.advertiser}`);
       else await sendPhoto(creativePath, `🖼 ${adData.advertiser}`);
     }
 
-    // Montar funil info
-    if (funnelSteps.length > 0) {
-      funnelReport = `\n📊 <b>FUNIL:</b> ${funnelSteps.map(s => s.type).join(' → ')}\n`;
-      funnelReport += `⬆️ Upsell: ${hasUpsell ? '✅' : '❌'} | ⬇️ Downsell: ${hasDownsell ? '✅' : '❌'} | 🎯 Quiz: ${hasQuiz ? '✅' : '❌'}\n`;
-      funnelReport += `🌐 Domínios: ${[...new Set(funnelSteps.map(s => s.domain))].join(', ')}\n`;
-    }
+    // Build clean ad copy (no nav noise)
+    const cleanAdCopy = extractSalesCopy(adData.text);
 
-    // Enviar detalhes
+    // Full funnel intelligence report
     await sendToTelegram(`
+⭐ <b>SCORE: ${score}/10</b>
 🏢 <b>Anunciante:</b> ${adData.advertiser}
 💰 <b>Preço:</b> ${priceLabel}
 🎨 <b>Criativo:</b> ${adData.hasVideo ? '🎥 Vídeo/VSL' : '🖼 Imagem'}
-⭐ <b>Score:</b> ${score}/100
+🏪 <b>Plataforma:</b> ${platform}
 📅 <b>Data início:</b> ${adData.dateText || 'Desconhecida'}
-${funnelReport}
-📝 <b>COPY:</b>
-${adData.text.substring(0, 500)}
+
+📊 <b>FUNIL (${funnelSteps.length} etapas):</b> ${funnelType}
+🎬 VSL: ${hasVSL ? '✅' : '❌'} | 🧩 Quiz: ${hasQuiz ? '✅' : '❌'}
+⬆️ Upsell: ${hasUpsell ? '✅' : '❌'} | ⬇️ Downsell: ${hasDownsell ? '✅' : '❌'}
+🛒 Checkout: ${hasCheckout ? '✅' : '❌'} | 📝 Copy longa: ${hasLongCopy ? '✅' : '❌'}
+🌐 Domínios: ${domains.length > 0 ? domains.join(', ') : 'N/A'}
+
+📝 <b>COPY DO ANÚNCIO:</b>
+${cleanAdCopy.substring(0, 400)}
 
 🔗 <b>Funil:</b> ${funnelUrl || 'N/A'}`);
 
-    // Enviar screenshots do funil
+    // Send funnel screenshots + VSL video + clean copy for each step
     for (let i = 0; i < funnelSteps.length; i++) {
       const step = funnelSteps[i];
-      if (step.screenshotPath) await sendPhoto(step.screenshotPath, `📸 Etapa ${i + 1} — ${step.type} | ${step.domain}`);
-      if (step.copy && i === 0) await sendToTelegram(`📝 <b>COPY DA PÁGINA:</b>\n${step.copy}`);
+
+      // If VSL — try to download and send the actual video file
+      if (step.type === 'VSL' && step.videoSrc && step.videoSrc.startsWith('http')) {
+        const ext = step.videoSrc.includes('.mp4') ? 'mp4' : 'mp4';
+        const vslPath = `vsl_${Date.now()}.${ext}`;
+        const downloaded = await downloadFile(step.videoSrc, vslPath);
+        if (downloaded && fs.existsSync(vslPath)) {
+          await sendVideo(vslPath, `🎬 VSL — Etapa ${i + 1} | ${step.domain}`);
+        } else {
+          // Fallback to screenshot
+          if (step.screenshotPath) await sendPhoto(step.screenshotPath, `📸 VSL — Etapa ${i + 1} | ${step.domain}`);
+        }
+      } else {
+        if (step.screenshotPath) await sendPhoto(step.screenshotPath, `📸 Etapa ${i + 1} — ${step.type} | ${step.domain}`);
+      }
+
+      // Send clean page copy (first step only to avoid spam)
+      if (step.copy && step.copy.length > 30 && i === 0) {
+        await sendToTelegram(`📝 <b>COPY DA PÁGINA (${step.type}):</b>\n${step.copy.substring(0, 600)}`);
+      }
     }
 
-    // Separador
     await sendToTelegram('━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     await delay(2000);
 
@@ -300,18 +517,16 @@ async function scrapeKeyword(keyword: string, country: string, context: BrowserC
       return;
     }
 
-    await sendToTelegram(`✅ <b>${count} anúncios encontrados</b>`);
+    await sendToTelegram(`✅ <b>${count} anúncios encontrados</b> (filtrando score ≥ ${MIN_QUALITY_SCORE}/10)`);
 
     for (let i = 0; i < count; i++) {
       try {
         const sponsoredEl = sponsoredLocator.nth(i);
 
-        // XPath: find the closest ancestor div that has an a[role="link"] inside it
-        // That link is always the advertiser name — uniquely scoped to each ad card
+        // XPath: closest ancestor div with an a[role="link"] inside = the ad card
         const cardLocator = sponsoredEl.locator('xpath=ancestor::div[.//a[@role="link"]][1]');
 
         const adData = await cardLocator.evaluate((cardEl: HTMLElement) => {
-          // Decode Facebook redirect URLs: l.facebook.com/l.php?u=REAL_URL
           function extractRealUrl(href: string): string | null {
             if (!href) return null;
             if (href.includes('l.facebook.com/l.php') || href.includes('lm.facebook.com')) {
@@ -404,7 +619,7 @@ async function main() {
     headless: true,
     executablePath: process.env.REPLIT_PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
   });
-  await sendToTelegram(`🚀 <b>Agente iniciado!</b>\n🌍 Brasil 🇧🇷 e Moçambique 🇲🇿\n💰 Faixa: R$9,99 — R$50`);
+  await sendToTelegram(`🚀 <b>Agente v2 iniciado!</b>\n🌍 Brasil 🇧🇷 e Moçambique 🇲🇿\n💰 Faixa: R$9,99 — R$50\n⭐ Filtro: Score ≥ ${MIN_QUALITY_SCORE}/10`);
 
   for (const country of COUNTRIES) {
     for (const [category, keywords] of Object.entries(KEYWORD_CATEGORIES)) {
@@ -414,7 +629,7 @@ async function main() {
       const context = await browser.newContext({
         locale: country === 'BR' ? 'pt-BR' : 'pt-MZ',
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        viewport: { width: 1280, height: 800 }
+        viewport: { width: 1920, height: 1080 },
       });
       const page = await context.newPage();
 
@@ -423,14 +638,16 @@ async function main() {
         await delay(4000);
       }
 
-      // Top 10 da categoria
-      if (categoryScores.length > 0) {
-        const top10 = categoryScores.sort((a, b) => b.score - a.score).slice(0, 10);
-        let summary = `🏆 <b>TOP ${top10.length} MELHORES OFERTAS — ${category.toUpperCase()}</b>\n\n`;
+      // Top 10 da categoria — only scored ads
+      const highQuality = categoryScores.filter(a => a.score >= MIN_QUALITY_SCORE);
+      if (highQuality.length > 0) {
+        const top10 = highQuality.sort((a, b) => b.score - a.score).slice(0, 10);
+        let summary = `🏆 <b>TOP ${top10.length} MELHORES — ${category.toUpperCase()}</b>\n\n`;
         top10.forEach((ad, i) => {
           summary += `${i + 1}. <b>${ad.advertiser}</b>\n`;
-          summary += `   ⭐ Score: ${ad.score}/100 | 💰 ${ad.price}\n`;
-          summary += `   🎨 ${ad.creativeType} | ⬆️ ${ad.hasUpsell ? 'Upsell ✅' : ''} ${ad.hasDownsell ? 'Downsell ✅' : ''}\n\n`;
+          summary += `   ⭐ Score: ${ad.score}/10 | 💰 ${ad.price}\n`;
+          summary += `   🎬 VSL: ${ad.hasVSL ? '✅' : '❌'} | ⬆️ ${ad.hasUpsell ? 'Upsell ✅' : ''} ${ad.hasDownsell ? 'Downsell ✅' : ''}\n`;
+          summary += `   🔗 ${ad.funnelUrl !== 'N/A' ? ad.funnelUrl.substring(0, 60) : 'N/A'}\n\n`;
         });
         summary += `\n💡 <b>Recomendação:</b> Clonar ofertas 1 e 2`;
         await sendToTelegram(summary);
