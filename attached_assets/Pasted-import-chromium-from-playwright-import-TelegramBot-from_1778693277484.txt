@@ -1,0 +1,233 @@
+import { chromium } from 'playwright';
+import TelegramBot from 'node-telegram-bot-api';
+import * as fs from 'fs';
+import * as dotenv from 'dotenv';
+
+dotenv.config();
+
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN!, { polling: false });
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
+const COUNTRIES = ['BR', 'MZ'];
+const MIN_PRICE = 9.99;
+const MAX_PRICE = 50;
+
+const KEYWORDS = [
+  'PDF', 'Receitas', 'Planner', 'Apostila', 'Moldes',
+  'Kit completo', 'Passo a passo', 'Dinâmicas',
+  'Material pronto', 'Aulas prontas', 'Baixe agora',
+  'Pacote completo', 'Kiwify', 'Hotmart', 'Cakto',
+  'Kirvano', 'Inlead'
+];
+
+async function sendToTelegram(message: string) {
+  try {
+    await bot.sendMessage(CHAT_ID, message, { parse_mode: 'HTML' });
+  } catch (e) {
+    console.error('Erro Telegram:', e);
+  }
+}
+
+async function sendPhotoToTelegram(imagePath: string, caption: string) {
+  try {
+    if (fs.existsSync(imagePath)) {
+      await bot.sendPhoto(CHAT_ID, imagePath, { caption: caption.substring(0, 1024) });
+      fs.unlinkSync(imagePath);
+    }
+  } catch (e) {
+    console.error('Erro ao enviar foto:', e);
+  }
+}
+
+function extractPrice(text: string): number | null {
+  const patterns = [
+    /R\$\s*(\d+[.,]\d{0,2})/gi,
+    /por apenas\s*(\d+[.,]\d{0,2})/gi,
+    /apenas\s*(\d+[.,]\d{0,2})/gi,
+    /(\d+[.,]\d{0,2})\s*reais/gi,
+    /(\d+[.,]?\d{0,2})\s*(?:reais|R\$)/gi
+  ];
+
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (match) {
+      const price = parseFloat(match[1].replace(',', '.'));
+      if (price >= MIN_PRICE && price <= MAX_PRICE) return price;
+    }
+  }
+  return null;
+}
+
+function detectFunnelType(text: string, links: string[]): string {
+  const lower = text.toLowerCase();
+  if (links.some(l => l.includes('whatsapp') || l.includes('wa.me'))) return '💬 WhatsApp Direto';
+  if (lower.includes('quiz') || lower.includes('responda')) return '🎯 Quiz';
+  if (lower.includes('webinar') || lower.includes('aula ao vivo')) return '🎓 Webinar';
+  if (lower.includes('checkout') || lower.includes('pagamento')) return '🛒 Checkout Direto';
+  if (lower.includes('assista') || lower.includes('vídeo')) return '🎥 VSL';
+  return '📄 Página de Vendas';
+}
+
+async function analyzeFunnelPage(context: any, url: string): Promise<any> {
+  const page = await context.newPage();
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.waitForTimeout(2000);
+
+    const screenshotPath = `funnel_${Date.now()}.png`;
+    await page.screenshot({ path: screenshotPath, fullPage: false });
+
+    const data = await page.evaluate(() => {
+      const text = document.body.innerText || '';
+      const links = Array.from(document.querySelectorAll('a')).map((a: any) => a.href);
+      const isQuiz = text.toLowerCase().includes('quiz') ||
+                     document.querySelectorAll('input[type="radio"]').length > 0;
+      const isWhatsApp = links.some((l: string) => l.includes('whatsapp') || l.includes('wa.me'));
+      const hasVideo = document.querySelectorAll('video, iframe[src*="youtube"], iframe[src*="vimeo"]').length > 0;
+      const hasUpsell = text.toLowerCase().includes('upsell') ||
+                        text.toLowerCase().includes('oferta especial') ||
+                        text.toLowerCase().includes('aproveite também') ||
+                        text.toLowerCase().includes('leve também');
+      const hasDownsell = text.toLowerCase().includes('espera') ||
+                          text.toLowerCase().includes('antes de sair') ||
+                          text.toLowerCase().includes('última chance');
+      const subdomains = [...new Set(links.map((l: string) => {
+        try { return new URL(l).hostname; } catch { return ''; }
+      }).filter(Boolean))];
+
+      return {
+        title: document.title,
+        text: text.substring(0, 600),
+        isQuiz, isWhatsApp, hasVideo, hasUpsell, hasDownsell,
+        subdomains: subdomains.slice(0, 5),
+        links: links.slice(0, 5)
+      };
+    });
+
+    return { ...data, screenshot: screenshotPath, url };
+  } catch (e) {
+    return null;
+  } finally {
+    await page.close();
+  }
+}
+
+async function scrapeKeyword(keyword: string, country: string, context: any, page: any) {
+  const countryName = country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿';
+  const searchUrl = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=${country}&q=${encodeURIComponent(keyword)}&search_type=keyword_unordered`;
+
+  try {
+    await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(4000);
+
+    // Scroll para carregar mais anúncios
+    await page.evaluate(() => window.scrollBy(0, 2000));
+    await page.waitForTimeout(2000);
+
+    const screenshotPath = `results_${country}_${Date.now()}.png`;
+    await page.screenshot({ path: screenshotPath });
+    await sendPhotoToTelegram(screenshotPath, `🔍 "${keyword}" — ${countryName}`);
+
+    const ads = await page.evaluate(() => {
+      const results: any[] = [];
+      const elements = document.querySelectorAll('[class*="x1dr75xp"], [class*="_7jyr"], [class*="x8t9es0"]');
+
+      elements.forEach((el: any) => {
+        const text = el.innerText || '';
+        if (text.length < 30) return;
+        const links = Array.from(el.querySelectorAll('a')).map((a: any) => a.href).filter(Boolean);
+        const hasVideo = el.querySelectorAll('video').length > 0;
+        const advertiser = el.querySelector('a[role="link"]')?.innerText?.trim() || 'Desconhecido';
+
+        results.push({ text: text.substring(0, 1000), links, hasVideo, advertiser });
+      });
+
+      return results.slice(0, 8);
+    });
+
+    if (ads.length === 0) {
+      console.log(`Nenhum anúncio para "${keyword}" em ${countryName}`);
+      return;
+    }
+
+    for (let i = 0; i < ads.length; i++) {
+      const ad = ads[i];
+      const price = extractPrice(ad.text);
+
+      // Filtrar por faixa de preço — se não tem preço, analisa na mesma
+      const priceLabel = price
+        ? `R$ ${price.toFixed(2)} ✅`
+        : '💡 Preço não identificado';
+
+      // Só analisa funil se tiver preço na faixa ou preço não identificado
+      let funnelInfo = '';
+      const funnelLink = ad.links.find((l: string) =>
+        l.startsWith('http') && !l.includes('facebook.com')
+      );
+
+      if (funnelLink) {
+        const funnel = await analyzeFunnelPage(context, funnelLink);
+        if (funnel) {
+          const funnelType = detectFunnelType(funnel.text, funnel.links);
+          funnelInfo = `
+<b>🔀 Tipo de Funil:</b> ${funnelType}
+<b>📌 Título da Página:</b> ${funnel.title || 'N/A'}
+<b>⬆️ Upsell:</b> ${funnel.hasUpsell ? '✅ Sim' : '❌ Não'}
+<b>⬇️ Downsell:</b> ${funnel.hasDownsell ? '✅ Sim' : '❌ Não'}
+<b>🎯 Quiz:</b> ${funnel.isQuiz ? '✅ Sim' : '❌ Não'}
+<b>🌐 Subdomínios:</b> ${funnel.subdomains.join(', ') || 'Nenhum'}`;
+
+          if (funnel.screenshot) {
+            await sendPhotoToTelegram(funnel.screenshot, `📸 Funil — ${ad.advertiser}`);
+          }
+        }
+      }
+
+      const message = `
+━━━━━━━━━━━━━━━━━━━
+📢 <b>ANÚNCIO ${i + 1} | ${keyword} | ${countryName}</b>
+━━━━━━━━━━━━━━━━━━━
+<b>🏢 Anunciante:</b> ${ad.advertiser}
+<b>💰 Preço Detectado:</b> ${priceLabel}
+<b>🎨 Criativo:</b> ${ad.hasVideo ? '🎥 Vídeo/VSL' : '🖼 Imagem'}
+
+<b>📝 COPY:</b>
+${ad.text.substring(0, 600)}
+${funnelInfo}
+<b>🔗 Link:</b> ${funnelLink || 'N/A'}
+━━━━━━━━━━━━━━━━━━━`;
+
+      await sendToTelegram(message);
+      await page.waitForTimeout(1500);
+    }
+
+  } catch (e) {
+    console.error(`Erro em "${keyword}" ${country}:`, e);
+  }
+}
+
+async function main() {
+  const browser = await chromium.launch({ headless: true });
+
+  await sendToTelegram(`🚀 <b>Agente iniciado!</b>\n📋 ${KEYWORDS.length} keywords\n🌍 Brasil 🇧🇷 e Moçambique 🇲🇿\n💰 Faixa: R$9,99 — R$50`);
+
+  for (const country of COUNTRIES) {
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+      locale: country === 'BR' ? 'pt-BR' : 'pt-MZ'
+    });
+    const page = await context.newPage();
+
+    for (const keyword of KEYWORDS) {
+      console.log(`🔍 Pesquisando: "${keyword}" — ${country}`);
+      await scrapeKeyword(keyword, country, context, page);
+      await page.waitForTimeout(3000);
+    }
+
+    await context.close();
+  }
+
+  await browser.close();
+  await sendToTelegram(`✅ <b>Pesquisa completa!</b>\nTodas as keywords verificadas.`);
+}
+
+main().catch(console.error);

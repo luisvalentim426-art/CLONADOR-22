@@ -1,0 +1,62 @@
+Refactor my Playwright + Telegram scraper into a reliable Facebook Ads funnel crawler.
+
+CURRENT PROBLEM:
+- The scraper is collecting wrong links from Facebook Ads Library (random sites like magazines, restaurants, unrelated domains)
+- It is NOT following the real ad destination correctly
+- It only takes screenshots of Ads Library pages, not the actual funnel pages
+- It is not decoding Facebook redirect links (l.facebook.com/l.php?u=...)
+- It is not reliably reaching landing pages or funnels
+
+GOAL:
+Build a stable funnel crawler that always follows the REAL ad destination and ignores all irrelevant Facebook UI links.
+
+REQUIREMENTS:
+
+1. LINK EXTRACTION FIX
+- Extract all <a> links from Ads Library pages
+- Decode Facebook redirect links:
+  - l.facebook.com/l.php?u= should be decoded using URLSearchParams "u"
+- Remove ALL links that are:
+  - facebook.com
+  - l.facebook.com
+  - lm.facebook.com
+- Keep ONLY external URLs
+
+2. FUNNEL ENTRY RULE
+- Only ONE funnel entry link must be selected per ad:
+  - the first valid external link
+- Ignore all other links
+
+3. NAVIGATION RULE
+- After finding the funnel link:
+  - ALWAYS navigate to it using Playwright page.goto()
+  - wait for networkidle
+
+4. SCREENSHOT RULE
+- Take screenshot ONLY after navigating to the real landing page
+- Do NOT screenshot Ads Library as final output (only optional debug)
+
+5. FUNNEL ANALYSIS
+On the landing page:
+- detect page type:
+  - quiz (radio buttons, multi-step forms, "next/continue")
+  - checkout (payment keywords)
+  - VSL (video/iframe presence)
+  - upsell/downsell (keywords)
+- extract all internal funnel steps (same or related domain)
+- follow up to max depth 5
+
+6. OUTPUT
+For each ad, send Telegram message containing:
+- advertiser
+- final landing URL
+- funnel type
+- number of steps detected
+- screenshots per step (not only first page)
+
+7. CRITICAL RULE
+Do NOT use raw DOM links from Ads Library as final destinations.
+You MUST resolve real external ad destination first, then crawl forward.
+
+Write production-ready TypeScript using Playwright and keep current Telegram integration.
+Refactor existing code, do not rewrite from scratch.

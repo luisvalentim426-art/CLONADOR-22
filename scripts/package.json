@@ -1,0 +1,21 @@
+{
+  "name": "@workspace/scripts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "hello": "tsx ./src/hello.ts",
+    "fb-ads-scraper": "tsx ./src/fb-ads-scraper.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@types/node-telegram-bot-api": "^0.64.14",
+    "tsx": "catalog:"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "node-telegram-bot-api": "^0.67.0",
+    "playwright": "^1.60.0"
+  }
+}

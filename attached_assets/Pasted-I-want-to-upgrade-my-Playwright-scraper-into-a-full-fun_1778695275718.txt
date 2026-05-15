@@ -1,0 +1,79 @@
+I want to upgrade my Playwright scraper into a full funnel crawler system.
+
+Current problem:
+- It only scrapes Ads Library pages
+- It does NOT follow the ad into the real landing page properly
+- It does NOT crawl multi-step funnels (quiz, upsells, downsells)
+- It does NOT capture screenshots per step
+- It does NOT analyze domain changes across funnel steps
+
+I need you to refactor the system into a recursive funnel crawler.
+
+Requirements:
+
+1. Funnel crawler logic
+- Start from a URL (ad link or landing page)
+- Visit page
+- Take screenshot of each step
+- Extract all outgoing links
+- Filter only internal funnel links (same domain or related redirect chain)
+- Follow links recursively up to maxDepth = 5
+- Avoid infinite loops (use visited Set)
+
+2. Funnel step detection
+For each page classify:
+- landing page
+- quiz step (multi-step form, radio buttons, "next/continue" flow)
+- checkout page (contains payment/price/checkout keywords)
+- upsell/downsell page
+- VSL/video page
+
+Use DOM signals like:
+- input[type=radio], forms, multi-step buttons
+- video/iframe
+- keywords in text
+
+3. Domain tracking
+For each step:
+- extract hostname
+- detect when domain changes inside funnel
+- mark funnel as single-domain or multi-domain
+
+4. Screenshot system
+- Save screenshot per step:
+  step_1.png, step_2.png, etc.
+- Include funnel ID in filename
+
+5. Output structure
+Return a structured object:
+
+{
+  funnelSteps: [
+    {
+      url,
+      domain,
+      type,
+      title,
+      screenshotPath,
+      links
+    }
+  ],
+  funnelTypeSummary,
+  totalSteps
+}
+
+6. Telegram integration
+Keep existing Telegram bot but:
+- send one message per funnel (not per page)
+- attach screenshots per step
+
+7. Important fix
+Do NOT just scrape Ads Library DOM.
+You must always:
+- open ad
+- follow outbound link
+- crawl actual landing funnel
+
+Write production-ready TypeScript using Playwright.
+
+Refactor my current code instead of writing a new unrelated script.
