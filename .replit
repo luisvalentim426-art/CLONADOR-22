@@ -11,6 +11,26 @@ env = { "CI" = "true" }
 [workflows]
 runButton = "Project"
 
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "npx ts-node --project tsconfig.run.json index.ts"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
 [agent]
 stack = "PNPM_WORKSPACE"
 expertMode = true
@@ -37,5 +57,5 @@ channel = "stable-25_05"
 [userenv]
 
 [userenv.shared]
-TELEGRAM_TOKEN = "8956740260:AAGhPgPFoiVCvJWl_KA28bvtTBtLxpCquS0"
+TELEGRAM_TOKEN = "8956740260:AAGtG3xRn68v7rTTnDokMJZWkTFqZOWJp04"
 TELEGRAM_CHAT_ID = "7983919481"
