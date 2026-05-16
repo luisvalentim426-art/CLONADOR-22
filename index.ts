@@ -15,9 +15,12 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 const MAX_ADS_COLLECT    = 15;   // how many cards to read per keyword
 const MAX_ADS_SEND       = 10;   // top N to send after ranking
 const KEYWORD_GAP_MS     = 15 * 60 * 1000;   // 15 min between keywords
-const CYCLE_SLEEP_MS     = 22 * 60 * 60 * 1000; // 22 h between full cycles
 const HISTORY_FILE       = 'history.json';
+const PROGRESS_FILE      = 'progress.json';
 const HISTORY_TTL_MS     = 23 * 60 * 60 * 1000; // skip re-analysis within 23 h
+const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // clear history after 7 days
+const CATEGORIES_PER_DAY = 3;   // keyword categories to run per daily execution
+const RUN_HOUR_UTC       = 5;   // 5:00 AM UTC = 7:00 AM Mozambique time
 const MIN_VIDEO_BYTES    = 50_000;  // reject video files smaller than this
 const MIN_IMAGE_BYTES    = 5_000;   // reject image files smaller than this
 
@@ -83,20 +86,41 @@ interface OfferAnalysis {
   ctaStrength: 'fraco' | 'médio' | 'forte';
 }
 
-// ─── History (memory between runs) ───────────────────────────────────────────
+// ─── History (memory between runs, auto-clears after 7 days) ─────────────────
 
 type HistoryEntry = { lastSeen: number; score: number; advertiser: string };
 type History = Record<string, HistoryEntry>;
 
 function loadHistory(): History {
   try {
-    if (fs.existsSync(HISTORY_FILE)) return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+    if (fs.existsSync(HISTORY_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+      const createdAt: number = raw._meta?.createdAt ?? Date.now();
+      const ageMs = Date.now() - createdAt;
+      if (ageMs > HISTORY_MAX_AGE_MS) {
+        console.log(`[HISTORY] ${Math.round(ageMs / 86400000)} days old — clearing for fresh start`);
+        return {};  // expired: return empty so a fresh file is created on next save
+      }
+      const { _meta, ...entries } = raw;
+      return entries as History;
+    }
   } catch {}
   return {};
 }
 
 function saveHistory(h: History) {
-  try { fs.writeFileSync(HISTORY_FILE, JSON.stringify(h, null, 2)); } catch {}
+  try {
+    // Preserve original createdAt if file exists and is not expired
+    let createdAt = Date.now();
+    try {
+      if (fs.existsSync(HISTORY_FILE)) {
+        const prev = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+        if (prev._meta?.createdAt && (Date.now() - prev._meta.createdAt) <= HISTORY_MAX_AGE_MS)
+          createdAt = prev._meta.createdAt;
+      }
+    } catch {}
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify({ _meta: { createdAt }, ...h }, null, 2));
+  } catch {}
 }
 
 function wasRecentlyAnalyzed(h: History, key: string): boolean {
@@ -106,6 +130,66 @@ function wasRecentlyAnalyzed(h: History, key: string): boolean {
 
 function markAnalyzed(h: History, key: string, score: number, advertiser: string) {
   h[key] = { lastSeen: Date.now(), score, advertiser };
+}
+
+// ─── Progress (daily category rotation) ──────────────────────────────────────
+
+const ALL_CATEGORY_NAMES = Object.keys(KEYWORD_CATEGORIES);
+
+interface Progress {
+  nextCategoryIndex: number;   // global rotation index into ALL_CATEGORY_NAMES
+  runDate: string;             // YYYY-MM-DD (UTC) of current/last run
+  todayCategories: string[];   // 3 categories planned for today's run
+  completedToday: string[];    // categories already completed today
+}
+
+function todayUTC(): string {
+  return new Date().toISOString().split('T')[0];
+}
+
+function loadProgress(): Progress {
+  try {
+    if (fs.existsSync(PROGRESS_FILE)) return JSON.parse(fs.readFileSync(PROGRESS_FILE, 'utf8'));
+  } catch {}
+  return { nextCategoryIndex: 0, runDate: '', todayCategories: [], completedToday: [] };
+}
+
+function saveProgress(p: Progress) {
+  try { fs.writeFileSync(PROGRESS_FILE, JSON.stringify(p, null, 2)); } catch {}
+}
+
+function planTodayCategories(p: Progress): Progress {
+  const today = todayUTC();
+  if (p.runDate === today && p.todayCategories.length > 0) {
+    return p; // already planned for today — resume
+  }
+  // New day: pick the next CATEGORIES_PER_DAY from the rotation
+  const n = ALL_CATEGORY_NAMES.length;
+  const cats: string[] = [];
+  for (let i = 0; i < CATEGORIES_PER_DAY; i++) {
+    cats.push(ALL_CATEGORY_NAMES[(p.nextCategoryIndex + i) % n]);
+  }
+  const next: Progress = {
+    nextCategoryIndex: (p.nextCategoryIndex + CATEGORIES_PER_DAY) % n,
+    runDate: today,
+    todayCategories: cats,
+    completedToday: [],
+  };
+  saveProgress(next);
+  return next;
+}
+
+async function waitUntilNextRun() {
+  const now = new Date();
+  const next = new Date();
+  next.setUTCHours(RUN_HOUR_UTC, 0, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1); // already past today's 5AM
+  const ms = next.getTime() - now.getTime();
+  const h  = Math.floor(ms / 3600000);
+  const m  = Math.floor((ms % 3600000) / 60000);
+  console.log(`[SCHEDULE] Sleeping ${h}h ${m}m until 05:00 UTC`);
+  await sendToTelegram(`⏰ <b>Análise diária concluída.</b>\nPróxima execução em <b>${h}h ${m}m</b> (05:00 UTC / 07:00 Moçambique).`);
+  await delay(ms);
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -1203,9 +1287,15 @@ async function sendKeywordRanking(keywordScores: Map<string, number[]>) {
   await sendToTelegram(msg);
 }
 
-// ─── Main Loop (autonomous, crash-resilient) ──────────────────────────────────
+// ─── Run engine for specific categories ───────────────────────────────────────
 
-async function runCycle(history: History, keywordScores: Map<string, number[]>, allAds: ScoredAd[]) {
+async function runCycle(
+  history: History,
+  keywordScores: Map<string, number[]>,
+  allAds: ScoredAd[],
+  categoriesToRun: string[],
+  onCategoryComplete?: (category: string) => void
+) {
   const browser = await chromium.launch({
     headless: true,
     executablePath: process.env.REPLIT_PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
@@ -1213,9 +1303,14 @@ async function runCycle(history: History, keywordScores: Map<string, number[]>, 
   });
 
   try {
-    for (const country of COUNTRIES) {
-      for (const [category, keywords] of Object.entries(KEYWORD_CATEGORIES)) {
-        await sendToTelegram(`\n📂 <b>CATEGORIA: ${category}</b> | ${country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿'}`);
+    // Category-outer, country-inner — so we can track progress per category
+    for (const category of categoriesToRun) {
+      const keywords = KEYWORD_CATEGORIES[category];
+      if (!keywords) continue;
+
+      for (const country of COUNTRIES) {
+        const countryName = country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿';
+        await sendToTelegram(`\n📂 <b>CATEGORIA: ${category}</b> | ${countryName}`);
 
         const context = await browser.newContext({
           locale: country === 'BR' ? 'pt-BR' : 'pt-MZ',
@@ -1228,7 +1323,6 @@ async function runCycle(history: History, keywordScores: Map<string, number[]>, 
           const kwAds = await scrapeKeyword(keyword, country, context, page, history, keywordScores);
           allAds.push(...kwAds);
 
-          // 15-minute gap between keywords
           console.log(`[WAIT] 15 min before next keyword...`);
           await sendToTelegram(`⏱️ Aguardando 15 min antes da próxima keyword...`);
           await delay(KEYWORD_GAP_MS);
@@ -1236,6 +1330,9 @@ async function runCycle(history: History, keywordScores: Map<string, number[]>, 
 
         await context.close();
       }
+
+      // Notify caller that this category is fully done (both countries)
+      onCategoryComplete?.(category);
     }
   } finally {
     await browser.close();
@@ -1243,33 +1340,87 @@ async function runCycle(history: History, keywordScores: Map<string, number[]>, 
 }
 
 async function main() {
-  const history: History = loadHistory();
-  const keywordScores    = new Map<string, number[]>();
-  let cycleNum = 1;
-
-  await sendToTelegram(`🚀 <b>Agente v5 — Motor Autônomo Iniciado!</b>\n🌍 Brasil 🇧🇷 + Moçambique 🇲🇿\n⏱️ 15 min entre keywords | 🔄 Ciclo contínuo\n📊 Gap analysis ao fim de cada ciclo\n📋 Histórico: ${Object.keys(history).length} entradas carregadas`);
-
   while (true) {
-    console.log(`\n═══════════ CICLO ${cycleNum} ═══════════`);
-    await sendToTelegram(`\n🔄 <b>INICIANDO CICLO ${cycleNum}</b>`);
-    const allAds: ScoredAd[] = []; // accumulate all ads this cycle
-    try {
-      await runCycle(history, keywordScores, allAds);
-      await sendKeywordRanking(keywordScores);
-      await sendCompetitiveGapAnalysis(allAds);
-      saveHistory(history);
-      await sendToTelegram(`✅ <b>CICLO ${cycleNum} COMPLETO!</b>\n📊 ${allAds.length} anúncios analisados no total\nPróximo ciclo em 22 horas...`);
-    } catch (err) {
-      console.error(`Cycle ${cycleNum} crashed:`, err);
-      await sendToTelegram(`⚠️ <b>Erro no ciclo ${cycleNum}. Reiniciando em 5 minutos...</b>`);
-      await delay(5 * 60 * 1000); // 5 min recovery pause
-      cycleNum++;
+    const history  = loadHistory();
+    let   progress = loadProgress();
+
+    // ── Plan today's 3 categories ──────────────────────────────────────────
+    progress = planTodayCategories(progress);
+    const todayCats  = progress.todayCategories;
+    const remaining  = todayCats.filter(c => !progress.completedToday.includes(c));
+    const historyAge = (() => {
+      try {
+        const raw = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+        const age = Date.now() - (raw._meta?.createdAt ?? Date.now());
+        return `${Math.round(age / 86400000)} dias`;
+      } catch { return 'novo'; }
+    })();
+
+    const totalCats   = ALL_CATEGORY_NAMES.length;
+    const doneOverall = progress.nextCategoryIndex;
+    const rotation    = `${doneOverall % totalCats}/${totalCats}`;
+
+    console.log(`\n═══════════ EXECUÇÃO DIÁRIA ${progress.runDate} ═══════════`);
+    console.log(`Categorias de hoje: ${todayCats.join(', ')}`);
+    console.log(`Já concluídas hoje: ${progress.completedToday.join(', ') || 'nenhuma'}`);
+    console.log(`Restam: ${remaining.join(', ') || 'nenhuma'}`);
+
+    if (remaining.length === 0) {
+      await sendToTelegram(`✅ <b>Todas as categorias de hoje já foram analisadas.</b>\nAguardando próxima execução às 05:00 UTC.`);
+      await waitUntilNextRun();
       continue;
     }
 
-    cycleNum++;
-    keywordScores.clear(); // reset per-cycle scores
-    await delay(CYCLE_SLEEP_MS); // sleep 22 h before next cycle
+    // ── Opening Telegram message ───────────────────────────────────────────
+    const catList = todayCats.map((c, i) => {
+      const done = progress.completedToday.includes(c);
+      const cur  = remaining[0] === c && !done;
+      return `${done ? '✅' : cur ? '▶️' : '⏳'} ${c}`;
+    }).join('\n');
+
+    await sendToTelegram(
+`🚀 <b>Agente v5 — Execução Diária</b>
+📅 <b>${progress.runDate}</b> | 05:00 UTC (07:00 Moçambique)
+🌍 Brasil 🇧🇷 + Moçambique 🇲🇿
+
+📂 <b>Categorias de hoje (${remaining.length} restante${remaining.length !== 1 ? 's' : ''}):</b>
+${catList}
+
+🔄 Rotação global: ${rotation} | 📋 Histórico: ${historyAge}
+⏱️ 15 min entre keywords | 🔁 Deduplificação ativa`
+    );
+
+    // ── Run each remaining category, saving progress after each ───────────
+    const keywordScores = new Map<string, number[]>();
+    const allAds: ScoredAd[] = [];
+
+    try {
+      await runCycle(history, keywordScores, allAds, remaining, (completedCat) => {
+        progress.completedToday.push(completedCat);
+        saveProgress(progress);
+        console.log(`[PROGRESS] Category "${completedCat}" saved. Done today: ${progress.completedToday.join(', ')}`);
+      });
+
+      // ── End-of-day reports ─────────────────────────────────────────────
+      if (keywordScores.size > 0) await sendKeywordRanking(keywordScores);
+      if (allAds.length >= 3)    await sendCompetitiveGapAnalysis(allAds);
+      saveHistory(history);
+
+      await sendToTelegram(
+`✅ <b>Análise do dia ${progress.runDate} concluída!</b>
+📂 Categorias: ${todayCats.join(', ')}
+📊 ${allAds.length} anúncio${allAds.length !== 1 ? 's' : ''} analisado${allAds.length !== 1 ? 's' : ''}
+🔄 Próximas categorias: ${Array.from({ length: CATEGORIES_PER_DAY }, (_, i) => ALL_CATEGORY_NAMES[(progress.nextCategoryIndex + i) % ALL_CATEGORY_NAMES.length]).join(', ')}`
+      );
+
+    } catch (err) {
+      console.error('Daily run crashed:', err);
+      saveHistory(history); // save whatever was collected before crash
+      await sendToTelegram(`⚠️ <b>Erro na execução diária. Retomando amanhã.</b>\n${String(err).substring(0, 200)}`);
+    }
+
+    // ── Sleep until 5:00 AM UTC tomorrow ──────────────────────────────────
+    await waitUntilNextRun();
   }
 }
 
@@ -1277,5 +1428,5 @@ main().catch(async (err) => {
   console.error('Fatal error:', err);
   try { await sendToTelegram(`🚨 <b>Erro fatal — reiniciando em 2 min:</b> ${String(err).substring(0, 200)}`); } catch {}
   await delay(2 * 60 * 1000);
-  main().catch(console.error); // self-restart on fatal error
+  main().catch(console.error);
 });
