@@ -860,7 +860,7 @@ async function scrapeKeyword(
   page: Page,
   history: History,
   keywordScores: Map<string, number[]>
-): Promise<void> {
+): Promise<ScoredAd[]> {
   const countryName = country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿';
   const searchUrl   = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=${country}&q=${encodeURIComponent(keyword)}&search_type=keyword_unordered`;
 
@@ -890,7 +890,7 @@ async function scrapeKeyword(
 
     if (count === 0) {
       await sendToTelegram(`⚠️ Nenhum anúncio para <b>${keyword}</b> em ${countryName}`);
-      return;
+      return [];
     }
 
     await sendToTelegram(`⏳ <b>${count} anúncios encontrados.</b> Coletando e analisando...`);
@@ -981,7 +981,7 @@ async function scrapeKeyword(
 
     if (scored.length === 0) {
       await sendToTelegram(`⚠️ Nenhum anúncio novo/válido para <b>${keyword}</b>`);
-      return;
+      return [];
     }
 
     // ── Step 4: rank and send top N ───────────────────────────────────────────
@@ -1008,9 +1008,181 @@ async function scrapeKeyword(
 
     await sendToTelegram(`✅ <b>CONCLUÍDO:</b> ${keyword} — ${topAds.length} ads enviados (${scored.length} únicos analisados de ${rawCards.length} encontrados)`);
 
+    return topAds;
+
   } catch (err) {
     console.error(`Keyword error "${keyword}":`, err);
+    return [];
   }
+}
+
+// ─── Competitive Gap Analysis ────────────────────────────────────────────────
+
+function freqMap(items: string[]): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const it of items) m.set(it, (m.get(it) || 0) + 1);
+  return m;
+}
+
+function sortedFreq(m: Map<string, number>): Array<[string, number]> {
+  return [...m.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+function pct(n: number, total: number) { return total > 0 ? Math.round((n / total) * 100) : 0; }
+
+async function sendCompetitiveGapAnalysis(allAds: ScoredAd[]) {
+  if (allAds.length < 3) return; // not enough data
+
+  const total = allAds.length;
+
+  // ── Frequency maps ────────────────────────────────────────────────────────
+  const angles    = freqMap(allAds.map(a => a.offerAngle));
+  const styles    = freqMap(allAds.map(a => a.creativeStyle));
+  const platforms = freqMap(allAds.map(a => a.platform));
+  const ctas      = freqMap(allAds.map(a => a.offerAnalysis.ctaStrength));
+  const complexities = freqMap(allAds.map(a => a.funnelComplexity));
+
+  const vslCount    = allAds.filter(a => a.hasVSL).length;
+  const quizCount   = allAds.filter(a => a.hasQuiz).length;
+  const upsellCount = allAds.filter(a => a.hasUpsell).length;
+  const strongCTA   = (ctas.get('forte') || 0);
+  const weakCTA     = (ctas.get('fraco') || 0);
+
+  // ── Winning combinations (quiz×angle, style×platform, etc.) ──────────────
+  const combos = freqMap(allAds.map(a =>
+    `${a.hasVSL ? 'VSL' : 'noVSL'}+${a.hasQuiz ? 'Quiz' : 'noQuiz'}+${a.offerAngle}+${a.creativeStyle}`
+  ));
+  const topCombos = sortedFreq(combos).slice(0, 3);
+
+  // ── Rare but high-performing: appears ≤ 2 times but avg score ≥ 6 ─────────
+  const rareHighPerf: string[] = [];
+  for (const [combo, cnt] of combos.entries()) {
+    if (cnt <= 2) {
+      const comboAds = allAds.filter(a =>
+        `${a.hasVSL ? 'VSL' : 'noVSL'}+${a.hasQuiz ? 'Quiz' : 'noQuiz'}+${a.offerAngle}+${a.creativeStyle}` === combo
+      );
+      const avgScore = comboAds.reduce((s, a) => s + a.score, 0) / comboAds.length;
+      if (avgScore >= 6) rareHighPerf.push(`${combo.replace(/\+/g, ' + ')} (score médio: ${avgScore.toFixed(1)})`);
+    }
+  }
+
+  // ── High-confidence ads with simple funnels (opportunity: upgrade them) ──
+  const highConfSimple = allAds.filter(a =>
+    a.performanceConfidence === 'alto' && a.funnelComplexity === 'simples'
+  );
+
+  // ── Angle gaps: strong score angle vs frequency ───────────────────────────
+  const angleAvgScore = new Map<string, number>();
+  for (const [angle] of angles.entries()) {
+    const group = allAds.filter(a => a.offerAngle === angle);
+    angleAvgScore.set(angle, group.reduce((s, a) => s + a.score, 0) / group.length);
+  }
+  const underusedHighScore = [...angles.entries()]
+    .filter(([, cnt]) => cnt === 1)
+    .map(([angle]) => ({ angle, avg: angleAvgScore.get(angle)! }))
+    .filter(x => x.avg >= 6)
+    .sort((a, b) => b.avg - a.avg);
+
+  // ── Best performing angle overall ─────────────────────────────────────────
+  const bestAngle = [...angleAvgScore.entries()].sort((a, b) => b[1] - a[1])[0];
+  const worstAngle = [...angleAvgScore.entries()].sort((a, b) => a[1] - b[1])[0];
+
+  // ── Creative style performance ─────────────────────────────────────────────
+  const styleAvgScore = new Map<string, number>();
+  for (const [style] of styles.entries()) {
+    const group = allAds.filter(a => a.creativeStyle === style);
+    styleAvgScore.set(style, group.reduce((s, a) => s + a.score, 0) / group.length);
+  }
+  const bestStyle  = [...styleAvgScore.entries()].sort((a, b) => b[1] - a[1])[0];
+  const topStyles  = [...styleAvgScore.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+  // ── Strategic recommendations ─────────────────────────────────────────────
+  const recs: string[] = [];
+  if (vslCount > total * 0.6)  recs.push('🔴 VSL supersaturado — considere quiz ou landing page simples');
+  if (quizCount < total * 0.2) recs.push('💎 Quiz subutilizado — diferenciação com quiz pode ganhar mercado');
+  if (upsellCount < total * 0.3) recs.push('💎 Upsell raro — adicionar upsell pode elevar ticket médio facilmente');
+  if (weakCTA > total * 0.5)   recs.push('🔴 CTAs fracos dominam — anúncio com CTA forte se destaca');
+  if (strongCTA < total * 0.2) recs.push('💎 CTA forte é raridade — copywriting agressivo vira diferencial');
+  const [topAngle, topAngleCount] = sortedFreq(angles)[0] || ['', 0];
+  if (topAngleCount > total * 0.5) recs.push(`🔴 Ângulo "${topAngle}" saturado — ${pct(topAngleCount, total)}% dos anúncios usam o mesmo ângulo`);
+  const [topStyle, topStyleCount] = sortedFreq(styles)[0] || ['', 0];
+  if (topStyleCount > total * 0.5) recs.push(`🔴 Estilo "${topStyle}" dominante — formatos alternativos têm menos concorrência`);
+  if (highConfSimple.length > 0) recs.push(`💎 ${highConfSimple.length} anúncio(s) de alta confiança com funil SIMPLES — adicionar quiz/upsell pode dobrar conversão`);
+  if (rareHighPerf.length > 0) recs.push(`🌟 Combinações raras mas eficazes detectadas — prime opportunity para first-mover`);
+  if (recs.length === 0) recs.push('✅ Mercado equilibrado — diferencie em copy e criativo');
+
+  // ── Message 1: saturation overview ───────────────────────────────────────
+  const topAnglesStr  = sortedFreq(angles).slice(0, 4).map(([a, n]) => `  ${a}: ${n}x (${pct(n, total)}%)`).join('\n');
+  const topStylesStr  = sortedFreq(styles).slice(0, 4).map(([s, n]) => `  ${s}: ${n}x (${pct(n, total)}%)`).join('\n');
+  const topPlatsStr   = sortedFreq(platforms).slice(0, 4).map(([p, n]) => `  ${p}: ${n}x (${pct(n, total)}%)`).join('\n');
+
+  await sendToTelegram(
+`📈 <b>ANÁLISE DE MERCADO — ${total} anúncios analisados no ciclo</b>
+
+⚠️ <b>SATURAÇÃO DE MERCADO</b>
+
+🎭 <b>Ângulos mais usados:</b>
+${topAnglesStr}
+
+🎨 <b>Estilos criativos:</b>
+${topStylesStr}
+
+🏪 <b>Plataformas:</b>
+${topPlatsStr}
+
+📊 Funil: VSL ${pct(vslCount, total)}% | Quiz ${pct(quizCount, total)}% | Upsell ${pct(upsellCount, total)}%
+💪 CTA: Forte ${pct(strongCTA, total)}% | Médio ${pct(ctas.get('médio')||0, total)}% | Fraco ${pct(weakCTA, total)}%`
+  );
+
+  // ── Message 2: winning combos + gaps ─────────────────────────────────────
+  const winComboStr = topCombos.map(([c, n], i) =>
+    `${i + 1}. ${c.replace(/\+/g, ' + ')} — ${n}x`
+  ).join('\n');
+
+  const rareStr = rareHighPerf.slice(0, 3).map(r => `  🌟 ${r}`).join('\n') || '  Nenhuma detectada ainda';
+
+  const underStr = underusedHighScore.slice(0, 3).map(u =>
+    `  💎 ${u.angle} — score médio ${u.avg.toFixed(1)}/10 (usado apenas 1x)`
+  ).join('\n') || '  Sem gaps claros ainda';
+
+  const highConfStr = highConfSimple.slice(0, 3).map(a =>
+    `  📌 ${a.advertiser} (${a.platform}) — score ${a.score}/10 sem upsell/quiz`
+  ).join('\n') || '  Nenhum detectado';
+
+  await sendToTelegram(
+`🔥 <b>PADRÕES VENCEDORES (combinações mais recorrentes):</b>
+${winComboStr}
+
+💎 <b>OPORTUNIDADES INEXPLORADAS:</b>
+${underStr}
+
+🌟 <b>COMBINAÇÕES RARAS MAS EFICAZES:</b>
+${rareStr}
+
+📌 <b>ALTO POTENCIAL SEM EXPLORAR FUNIL:</b>
+${highConfStr}`
+  );
+
+  // ── Message 3: performance insights + strategic recs ──────────────────────
+  const topStylesPerf = topStyles.map(([s, avg]) => `  ${s}: ${avg.toFixed(1)}/10`).join('\n');
+  const recsStr = recs.map(r => `• ${r}`).join('\n');
+
+  await sendToTelegram(
+`🎯 <b>PERFORMANCE POR ÂNGULO:</b>
+  🏆 Melhor: ${bestAngle?.[0] || 'N/A'} (${bestAngle?.[1]?.toFixed(1) || '—'}/10)
+  ⚠️ Pior: ${worstAngle?.[0] || 'N/A'} (${worstAngle?.[1]?.toFixed(1) || '—'}/10)
+
+📹 <b>ESTILOS MAIS PERFORMÁTICOS:</b>
+${topStylesPerf}
+
+🧠 <b>RECOMENDAÇÕES ESTRATÉGICAS:</b>
+${recsStr}
+
+🎯 <b>POSICIONAMENTO SUGERIDO:</b>
+✅ Clonar: ${bestAngle?.[0] || 'N/A'} + ${bestStyle?.[0] || 'N/A'}
+🔴 Evitar: ${worstAngle?.[0] || 'N/A'} (baixa performance)
+💎 Diferenciação: ${underusedHighScore[0]?.angle || rareHighPerf[0]?.split('(')[0]?.trim() || 'Quiz + ângulo alternativo'}`
+  );
 }
 
 // ─── Final Keyword Ranking ────────────────────────────────────────────────────
@@ -1033,7 +1205,7 @@ async function sendKeywordRanking(keywordScores: Map<string, number[]>) {
 
 // ─── Main Loop (autonomous, crash-resilient) ──────────────────────────────────
 
-async function runCycle(history: History, keywordScores: Map<string, number[]>) {
+async function runCycle(history: History, keywordScores: Map<string, number[]>, allAds: ScoredAd[]) {
   const browser = await chromium.launch({
     headless: true,
     executablePath: process.env.REPLIT_PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
@@ -1053,7 +1225,8 @@ async function runCycle(history: History, keywordScores: Map<string, number[]>) 
         const page = await context.newPage();
 
         for (const keyword of keywords) {
-          await scrapeKeyword(keyword, country, context, page, history, keywordScores);
+          const kwAds = await scrapeKeyword(keyword, country, context, page, history, keywordScores);
+          allAds.push(...kwAds);
 
           // 15-minute gap between keywords
           console.log(`[WAIT] 15 min before next keyword...`);
@@ -1074,16 +1247,18 @@ async function main() {
   const keywordScores    = new Map<string, number[]>();
   let cycleNum = 1;
 
-  await sendToTelegram(`🚀 <b>Agente v4 — Motor Autônomo Iniciado!</b>\n🌍 Brasil 🇧🇷 + Moçambique 🇲🇿\n⏱️ 15 min entre keywords | 🔄 Ciclo contínuo\n📋 Histórico: ${Object.keys(history).length} entradas carregadas`);
+  await sendToTelegram(`🚀 <b>Agente v5 — Motor Autônomo Iniciado!</b>\n🌍 Brasil 🇧🇷 + Moçambique 🇲🇿\n⏱️ 15 min entre keywords | 🔄 Ciclo contínuo\n📊 Gap analysis ao fim de cada ciclo\n📋 Histórico: ${Object.keys(history).length} entradas carregadas`);
 
   while (true) {
     console.log(`\n═══════════ CICLO ${cycleNum} ═══════════`);
     await sendToTelegram(`\n🔄 <b>INICIANDO CICLO ${cycleNum}</b>`);
+    const allAds: ScoredAd[] = []; // accumulate all ads this cycle
     try {
-      await runCycle(history, keywordScores);
+      await runCycle(history, keywordScores, allAds);
       await sendKeywordRanking(keywordScores);
+      await sendCompetitiveGapAnalysis(allAds);
       saveHistory(history);
-      await sendToTelegram(`✅ <b>CICLO ${cycleNum} COMPLETO!</b>\nPróximo ciclo em 22 horas...`);
+      await sendToTelegram(`✅ <b>CICLO ${cycleNum} COMPLETO!</b>\n📊 ${allAds.length} anúncios analisados no total\nPróximo ciclo em 22 horas...`);
     } catch (err) {
       console.error(`Cycle ${cycleNum} crashed:`, err);
       await sendToTelegram(`⚠️ <b>Erro no ciclo ${cycleNum}. Reiniciando em 5 minutos...</b>`);
