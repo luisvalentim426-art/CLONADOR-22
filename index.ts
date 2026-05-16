@@ -66,6 +66,11 @@ interface ScoredAd {
   funnelStepData: any[];
   offerAnalysis: OfferAnalysis;
   similarCount: number;
+  offerAngle: string;
+  creativeStyle: string;
+  funnelComplexity: 'simples' | 'médio' | 'avançado';
+  performanceConfidence: 'baixo' | 'médio' | 'alto';
+  recommendationLevel: string;
 }
 
 interface OfferAnalysis {
@@ -300,6 +305,146 @@ function buildCloneReasons(ad: ScoredAd): string {
   if (ad.offerAnalysis.ctaStrength === 'forte') reasons.push('💪 CTA forte — ação direta');
   if (ad.funnelSteps > 2) reasons.push(`📊 Funil de ${ad.funnelSteps} etapas — alta sofisticação`);
   return reasons.length > 0 ? reasons.join('\n') : '✅ Melhor score geral na keyword';
+}
+
+// ─── New Intelligence: Offer Angle Detection ──────────────────────────────────
+
+function detectOfferAngle(copy: string, funnelText: string): string {
+  const all = (copy + ' ' + funnelText).toLowerCase();
+
+  if (/últimas vagas|acaba hoje|apenas hoje|termina em|restam \d|vagas limitadas|corre que|só até/i.test(all))
+    return '⏰ Urgência';
+  if (/segredo|você não vai acreditar|descubra o que|ninguém te conta|método proibido|hack|truque/i.test(all))
+    return '🤫 Curiosidade';
+  if (/antes.*depois|resultado real|comprovado|perdeu \d|eliminei|emagreci|consegui|mudou minha/i.test(all))
+    return '🔄 Antes/depois';
+  if (/cansad[ao] de|frustrad[ao]|dificuldade|sofrendo|sem conseguir|tentei tudo|não funciona|dor de/i.test(all))
+    return '😣 Baseado em dor';
+  if (/transforme|mude sua vida|nova versão|nova fase|conquiste|evolução|mudança real/i.test(all))
+    return '✨ Transformação';
+  if (/ganhe dinheiro|renda extra|liberdade financeira|faturar|lucro|monetize|independência financeira/i.test(all))
+    return '💰 Financeiro';
+  if (/especialista|anos de experiência|formad[ao]|certificad[ao]|médico|nutricionista|coach|autoridade/i.test(all))
+    return '🏆 Autoridade';
+  if (/família|filho|amor|emoção|conexão|felicidade|sonho|história|depoimento/i.test(all))
+    return '❤️ Emocional';
+  if (/aproveite|oportunidade única|chance|agora é a hora|não perca essa|momento certo/i.test(all))
+    return '🚀 Oportunidade';
+  return '💡 Informativo';
+}
+
+// ─── New Intelligence: Creative Style Detection ───────────────────────────────
+
+function detectCreativeStyle(hasVideo: boolean, imageCount: number, copy: string): string {
+  const c = copy.toLowerCase();
+  if (!hasVideo) {
+    if (/antes.*depois|resultado.*\d+(kg|dias|semanas)/i.test(c)) return '🔄 Antes/depois';
+    if (imageCount > 1)                                             return '🖼️ Slideshow';
+    return '🖼️ Banner estático';
+  }
+  // video
+  if (/tutorial|passo a passo|como fazer|veja como|tela do/i.test(c)) return '🖥️ Screen recording';
+  if (/depoimento|resultado real|cliente|usou|funcionou pra mim|minha experiência/i.test(c)) return '💬 Testemunho';
+  if (/gerado por ia|feito com ia|ia criou|ai generated/i.test(c)) return '🤖 IA gerado';
+  if (/câmera|filmagem|produção|estúdio|profissional|cinematográf/i.test(c)) return '🎬 Cinemático';
+  if (/olha|aqui|to mostrando|fiz isso|eu mesm[ao]|gravei aqui/i.test(c)) return '📱 UGC';
+  return '🎙️ Talking head';
+}
+
+// ─── New Intelligence: Funnel Complexity ──────────────────────────────────────
+
+function detectFunnelComplexity(ad: Pick<ScoredAd, 'funnelSteps' | 'hasQuiz' | 'hasVSL' | 'hasUpsell' | 'hasDownsell' | 'domains'>): 'simples' | 'médio' | 'avançado' {
+  const { funnelSteps, hasQuiz, hasVSL, hasUpsell, hasDownsell, domains } = ad;
+  const quizAndUpsell = hasQuiz && (hasUpsell || hasDownsell);
+  const multiDomain   = domains.length > 1;
+  if (quizAndUpsell || funnelSteps >= 4 || (hasVSL && hasUpsell && funnelSteps >= 3) || (multiDomain && funnelSteps >= 3)) return 'avançado';
+  if (funnelSteps >= 2 || hasQuiz || hasUpsell || hasVSL) return 'médio';
+  return 'simples';
+}
+
+// ─── New Intelligence: Performance Confidence ─────────────────────────────────
+
+function detectPerformanceConfidence(ad: Pick<ScoredAd, 'score' | 'similarCount' | 'funnelComplexity' | 'hasVSL' | 'offerAnalysis'>): 'baixo' | 'médio' | 'alto' {
+  let points = 0;
+  if (ad.score >= 7)                                    points += 3;
+  else if (ad.score >= 5)                               points += 2;
+  else if (ad.score >= 3)                               points += 1;
+  if (ad.similarCount >= 3)                             points += 2;
+  else if (ad.similarCount >= 2)                        points += 1;
+  if (ad.funnelComplexity === 'avançado')               points += 2;
+  else if (ad.funnelComplexity === 'médio')             points += 1;
+  if (ad.hasVSL)                                        points += 1;
+  if (ad.offerAnalysis.ctaStrength === 'forte')         points += 1;
+  if (ad.offerAnalysis.hasUrgency && ad.offerAnalysis.hasBonus) points += 1;
+
+  if (points >= 8) return 'alto';
+  if (points >= 4) return 'médio';
+  return 'baixo';
+}
+
+// ─── New Intelligence: Recommendation Level ──────────────────────────────────
+
+function computeRecommendationLevel(ad: ScoredAd): string {
+  const conf = ad.performanceConfidence;
+  const cplx = ad.funnelComplexity;
+  if (conf === 'alto' && cplx === 'avançado') return '🔥 Clonar agora';
+  if (conf === 'alto')                         return '✅ Alta prioridade';
+  if (conf === 'médio' && cplx !== 'simples')  return '👀 Vale testar';
+  if (conf === 'médio')                         return '📌 Monitorar';
+  return '⚪ Referência apenas';
+}
+
+// ─── Comparison Table ─────────────────────────────────────────────────────────
+
+async function sendComparisonTable(ads: ScoredAd[], keyword: string, country: string) {
+  if (ads.length === 0) return;
+  const countryName = country === 'BR' ? '🇧🇷' : '🇲🇿';
+  const confIcon = (c: string) => c === 'alto' ? '🟢' : c === 'médio' ? '🟡' : '🔴';
+  const cplxIcon = (c: string) => c === 'avançado' ? '🔷' : c === 'médio' ? '🔹' : '⬜';
+  const yn       = (b: boolean) => b ? '✅' : '❌';
+
+  let table = `📊 <b>TABELA COMPARATIVA — ${keyword} ${countryName}</b>\n\n`;
+  table += `<code>`;
+  table += `#  Anunciante             Sc  VSL Quiz Up  Etps Plat       CTA    Conf\n`;
+  table += `${'─'.repeat(78)}\n`;
+
+  for (let i = 0; i < ads.length; i++) {
+    const a   = ads[i];
+    const num = String(i + 1).padEnd(3);
+    const adv = a.advertiser.substring(0, 20).padEnd(21);
+    const sc  = `${a.score}/10`.padEnd(4);
+    const vsl = yn(a.hasVSL).padEnd(4);
+    const qz  = yn(a.hasQuiz).padEnd(4);
+    const up  = yn(a.hasUpsell).padEnd(4);
+    const stp = String(a.funnelSteps).padEnd(4);
+    const plt = a.platform.substring(0, 10).padEnd(11);
+    const cta = a.offerAnalysis.ctaStrength.padEnd(6);
+    const cf  = confIcon(a.performanceConfidence);
+    table += `${num}${adv}${sc}${vsl}${qz}${up}${stp}${plt}${cta}${cf}\n`;
+  }
+
+  table += `</code>\n\n`;
+
+  // Details section — each ad gets one line
+  table += `<b>Detalhes:</b>\n`;
+  for (let i = 0; i < ads.length; i++) {
+    const a = ads[i];
+    const badge = i === 0 ? '🏆' : `#${i + 1}`;
+    table += `${badge} <b>${a.advertiser.substring(0, 25)}</b>\n`;
+    table += `   Ângulo: ${a.offerAngle} | Estilo: ${a.creativeStyle}\n`;
+    table += `   Complexidade: ${cplxIcon(a.funnelComplexity)} ${a.funnelComplexity} | Preço: ${a.price}\n`;
+    table += `   Recomendação: <b>${a.recommendationLevel}</b>\n\n`;
+  }
+
+  // Best-to-clone highlight
+  const best = ads[0];
+  table += `\n🏆 <b>MELHOR OFERTA PARA CLONAR:</b>\n`;
+  table += `<b>${best.advertiser}</b>\n`;
+  table += `Score ${best.score}/10 | ${best.offerAngle} | ${best.creativeStyle}\n`;
+  table += `Funil: ${best.funnelComplexity} | Confiança: ${best.performanceConfidence}\n`;
+  table += `CTA: ${best.offerAnalysis.ctaStrength} | Plataforma: ${best.platform}`;
+
+  await sendToTelegram(table);
 }
 
 function extractSalesCopy(rawText: string, advertiserName?: string): string {
@@ -578,16 +723,32 @@ async function collectAd(
     const allFunnelText = funnelStepData.map((s: any) => s.rawText || '').join(' ');
     const offerAnalysis = analyzeOffer(cleanCopy, allFunnelText);
 
+    // New intelligence layers
+    const offerAngle    = detectOfferAngle(cleanCopy, allFunnelText);
+    const creativeStyle = detectCreativeStyle(rawCard.hasVideo, (rawCard.images || []).length, rawCard.text);
+
+    // Build partial object to compute derived fields
+    const partial = {
+      hasVSL, hasQuiz, hasUpsell, hasDownsell,
+      funnelSteps: funnelStepData.length,
+      domains,
+      score,
+      similarCount: rawCard.similarCount || 1,
+      offerAnalysis,
+    };
+    const funnelComplexity      = detectFunnelComplexity(partial);
+    const performanceConfidence = detectPerformanceConfidence({ ...partial, funnelComplexity });
+
     markAnalyzed(history, histKey, score, rawCard.advertiser);
 
-    return {
+    const baseAd: Omit<ScoredAd, 'recommendationLevel'> = {
       advertiser: rawCard.advertiser,
       keyword,
       country,
       score,
       price,
       priceNum,
-      creativeType: rawCard.hasVideo ? '🎥 Vídeo' : '🖼 Imagem',
+      creativeType: rawCard.hasVideo ? '🎥 Vídeo' : '🖼️ Imagem',
       dateText: rawCard.dateText,
       hasVSL, hasQuiz, hasUpsell, hasDownsell, hasCheckout, hasLongCopy,
       funnelSteps: funnelStepData.length,
@@ -602,7 +763,13 @@ async function collectAd(
       funnelStepData,
       offerAnalysis,
       similarCount: rawCard.similarCount || 1,
+      offerAngle,
+      creativeStyle,
+      funnelComplexity,
+      performanceConfidence,
     };
+    const ad: ScoredAd = { ...baseAd, recommendationLevel: computeRecommendationLevel(baseAd as ScoredAd) };
+    return ad;
   } catch (err) {
     console.error('collectAd error:', err);
     return null;
@@ -624,27 +791,31 @@ async function sendAdReport(ad: ScoredAd, rank: number, isBest: boolean) {
   }
 
   // Main card
-  const offer = ad.offerAnalysis;
+  const offer   = ad.offerAnalysis;
+  const confIcon = ad.performanceConfidence === 'alto' ? '🟢' : ad.performanceConfidence === 'médio' ? '🟡' : '🔴';
+  const cplxIcon = ad.funnelComplexity === 'avançado' ? '🔷' : ad.funnelComplexity === 'médio' ? '🔹' : '⬜';
   await sendToTelegram(`\
 🎯 <b>#${rank} | ${ad.keyword} | ${countryName}</b>${bestHeader}${dupNote}
 
-⭐ <b>Score: ${ad.score}/10</b>
+⭐ <b>Score: ${ad.score}/10</b> | ${confIcon} Confiança: <b>${ad.performanceConfidence}</b>
 🏢 <b>Anunciante:</b> ${ad.advertiser}
 💰 <b>Preço:</b> ${ad.price}
-🎨 <b>Criativo:</b> ${ad.creativeType}
+🎨 <b>Criativo:</b> ${ad.creativeType} — ${ad.creativeStyle}
 🏪 <b>Plataforma:</b> ${ad.platform}
 📅 <b>Data início:</b> ${ad.dateText || 'Desconhecida'}
 
+🎭 <b>Ângulo da oferta:</b> ${ad.offerAngle}
 📦 <b>OFERTA:</b> ${offer.product}
 💡 <b>Promessa:</b> ${offer.mainPromise}
 ${offer.hasBonus ? '🎁 Bônus: ✅' : ''} ${offer.hasUrgency ? '⏰ Urgência: ✅' : ''} ${offer.hasGuarantee ? '🛡️ Garantia: ✅' : ''} ${offer.hasRecurring ? '🔄 Recorrente: ✅' : ''}
 💪 <b>CTA:</b> ${offer.ctaStrength}
 
-📊 <b>Funil (${ad.funnelSteps} etapas):</b> ${ad.funnelType}
+${cplxIcon} <b>Complexidade:</b> ${ad.funnelComplexity} | <b>Funil (${ad.funnelSteps} etapas):</b> ${ad.funnelType}
 🎬 VSL: ${ad.hasVSL ? '✅' : '❌'} | 🧩 Quiz: ${ad.hasQuiz ? '✅' : '❌'}
 ⬆️ Upsell: ${ad.hasUpsell ? '✅' : '❌'} | ⬇️ Downsell: ${ad.hasDownsell ? '✅' : '❌'}
 🛒 Checkout: ${ad.hasCheckout ? '✅' : '❌'} | 📝 Copy longa: ${ad.hasLongCopy ? '✅' : '❌'}
 🌐 <b>Domínios:</b> ${ad.domains.length > 0 ? ad.domains.join(', ') : 'N/A'}
+📌 <b>Recomendação:</b> ${ad.recommendationLevel}
 🔗 <b>Funil:</b> ${ad.funnelUrl}`);
 
   // Copy
@@ -828,6 +999,9 @@ async function scrapeKeyword(
     for (let i = 0; i < topAds.length; i++) {
       await sendAdReport(topAds[i], i + 1, i === 0);
     }
+
+    // ── Step 5: comparison table ──────────────────────────────────────────────
+    await sendComparisonTable(topAds, keyword, country);
 
     // Persist history after each keyword
     saveHistory(history);
