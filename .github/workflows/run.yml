@@ -10,12 +10,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+
       - uses: actions/setup-node@v3
         with:
           node-version: '20'
-      - run: npm install
-      - run: npx playwright install chromium
-      - run: npx ts-node --project tsconfig.run.json index.ts
+
+      - name: Instalar pnpm
+        run: npm install -g pnpm
+
+      - name: Instalar dependências
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Instalar Playwright
+        run: npx playwright install chromium --with-deps
+
+      - name: Correr agente
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: npx ts-node --project tsconfig.run.json index.ts
