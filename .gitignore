@@ -40,7 +40,8 @@ testem.log
 # System Files
 .DS_Store
 Thumbs.db
-
+progress.json
+history.json
 .cursor/rules/nx-rules.mdc
 .github/instructions/nx.instructions.md
 
