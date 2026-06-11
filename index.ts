@@ -825,16 +825,16 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
       await page.screenshot({ path: screenshotPath, fullPage: true });
 
       const pageData = await page.evaluate(() => {
-        const skip = new Set<Node>();
+        const skip = new Set();
         ['nav', 'footer', 'aside', 'header', '[aria-hidden="true"]', '[class*="cookie"]',
          '[class*="nav"]', '[class*="footer"]', '[class*="menu"]', '[class*="header"]',
          'script', 'style', 'noscript'].forEach(sel => {
           try { document.querySelectorAll(sel).forEach(el => skip.add(el)); } catch {}
         });
 
-        function getVisibleText(root: Element): string {
+        const getVisibleText = (root) => {
           const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-            acceptNode(node) {
+            acceptNode: (node) => {
               let el = node.parentElement;
               while (el) {
                 if (skip.has(el)) return NodeFilter.FILTER_REJECT;
@@ -845,33 +845,32 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
               return NodeFilter.FILTER_ACCEPT;
             }
           });
-          const parts: string[] = [];
-          let n: Node | null;
+          const parts = [];
+          let n;
           while ((n = walker.nextNode())) { const t = (n.textContent || '').trim(); if (t.length > 2) parts.push(t); }
           return parts.join('\n');
-        }
+        };
 
         const mainEl = document.querySelector('main, article, [role="main"], .main, #main, section') || document.body;
-        const rawText = getVisibleText(mainEl as Element);
+        const rawText = getVisibleText(mainEl);
         const fullText = document.body.innerText || '';
         const lower = fullText.toLowerCase();
 
-        // Extract real offer title: og:title > <title> > h1
-        const ogTitle = (document.querySelector('meta[property="og:title"]') as HTMLMetaElement)?.content || '';
+        const ogTitleEl = document.querySelector('meta[property="og:title"]');
+        const ogTitle = ogTitleEl ? ogTitleEl.getAttribute('content') || '' : '';
         const titleTag = document.title || '';
-        const h1Text = (document.querySelector('h1') as HTMLElement)?.innerText?.trim() || '';
+        const h1El = document.querySelector('h1');
+        const h1Text = h1El ? (h1El.innerText || '').trim() : '';
         const pageHtml = document.documentElement.outerHTML.substring(0, 5000);
 
         const hasVideo = !!(document.querySelector('video') ||
           document.querySelector('iframe[src*="youtube"]') || document.querySelector('iframe[src*="vimeo"]') ||
           document.querySelector('iframe[src*="wistia"]') || document.querySelector('iframe[src*="panda"]'));
 
-        const videoSrc =
-          (document.querySelector('video source') as HTMLSourceElement)?.src ||
-          (document.querySelector('video') as HTMLVideoElement)?.src ||
-          (document.querySelector('iframe[src*="panda"]') as HTMLIFrameElement)?.src ||
-          (document.querySelector('iframe[src*="youtube"]') as HTMLIFrameElement)?.src ||
-          (document.querySelector('iframe[src*="vimeo"]') as HTMLIFrameElement)?.src || null;
+        const videoSrcEl = document.querySelector('video source') || document.querySelector('video') ||
+          document.querySelector('iframe[src*="panda"]') || document.querySelector('iframe[src*="youtube"]') ||
+          document.querySelector('iframe[src*="vimeo"]');
+        const videoSrc = videoSrcEl ? (videoSrcEl.src || null) : null;
 
         const radioInputs = document.querySelectorAll('input[type="radio"]').length;
         const hasUpsell   = lower.includes('leve também') || lower.includes('adicione ao pedido') || lower.includes('aproveite também');
@@ -883,13 +882,13 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
 
         const ctaKeywords = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'próximo', 'continuar', 'começar', 'inscrever'];
         const ctaLinks = Array.from(document.querySelectorAll('a, button'))
-          .filter((el: any) => { const t = (el.innerText || '').toLowerCase(); return ctaKeywords.some(k => t.includes(k)); })
-          .map((el: any) => el.href || null)
-          .filter((h: string | null): h is string => !!h && !h.includes('javascript:'));
+          .filter(el => { const t = (el.innerText || '').toLowerCase(); return ctaKeywords.some(k => t.includes(k)); })
+          .map(el => el.href || null)
+          .filter(h => !!h && !h.includes('javascript:'));
 
         const waLinks = Array.from(document.querySelectorAll('a'))
-          .map((a: any) => a.href as string)
-          .filter((h: string) => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
+          .map(a => a.href)
+          .filter(h => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
 
         return { rawText: rawText.substring(0, 3000), hasVideo, videoSrc, radioInputs, hasUpsell, hasDownsell, hasCheckout, isQuiz, hasLongCopy, ctaLinks: ctaLinks.slice(0, 3), waLinks: waLinks.slice(0, 2), ogTitle, titleTag, h1Text, pageHtml };
       });
@@ -1195,10 +1194,10 @@ async function scrapeKeyword(
         const sponsored = sponsoredLocator.nth(i);
         const card = sponsored.locator('xpath=ancestor::div[.//a[@role="link"]][1]');
 
-        const raw = await card.evaluate((el: HTMLElement) => {
+        const raw = await card.evaluate((el) => {
           const blockedDomains = ['facebook.com','fb.com','instagram.com','play.google.com','apps.apple.com','youtube.com','google.com','apple.com','adjust.com','onelink.to','app.adjust','branch.io'];
 
-          function realUrl(href: string): string | null {
+          const realUrl = (href) => {
             if (!href) return null;
             if (href.includes('l.facebook.com/l.php') || href.includes('lm.facebook.com')) {
               try { const u = new URL(href).searchParams.get('u'); if (u) return decodeURIComponent(u); } catch {}
@@ -1206,20 +1205,20 @@ async function scrapeKeyword(
             }
             if (href.startsWith('http') && !blockedDomains.some(d => href.includes(d))) return href;
             return null;
-          }
+          };
 
           const ctaBtns = ['saiba mais','comprar','baixe','quero','acessar','garantir','clique','ver mais','obter','assinar','inscrever','começar'];
-          const allRoleLinks = Array.from(el.querySelectorAll('a[role="link"]')) as HTMLElement[];
+          const allRoleLinks = Array.from(el.querySelectorAll('a[role="link"]'));
           const advertiserEl = allRoleLinks.find(a => {
             const t = (a.innerText || '').toLowerCase().trim();
             return t.length > 0 && t.length < 60 && !ctaBtns.some(k => t.includes(k));
           }) || null;
-          const advertiser = advertiserEl?.innerText?.trim() || 'Desconhecido';
+          const advertiser = advertiserEl ? (advertiserEl.innerText || '').trim() : 'Desconhecido';
 
           let text = '';
           el.childNodes.forEach(node => {
-            if (node !== advertiserEl && !(node as HTMLElement).contains?.(advertiserEl)) {
-              text += (node as HTMLElement).innerText || node.textContent || '';
+            if (node !== advertiserEl && !node.contains?.(advertiserEl)) {
+              text += node.innerText || node.textContent || '';
             }
           });
           if (!text.trim()) {
@@ -1227,33 +1226,33 @@ async function scrapeKeyword(
             if (advertiser && text.startsWith(advertiser)) text = text.slice(advertiser.length);
           }
 
-          const images: string[] = [];
-          el.querySelectorAll('img').forEach((img: any) => {
+          const images = [];
+          el.querySelectorAll('img').forEach(img => {
             const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
             if (src && src.startsWith('https://') && !src.includes('emoji') && !src.includes('static') && src.length > 50) images.push(src);
             const ss = img.getAttribute('srcset') || '';
             if (ss) {
-              const biggest = ss.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-                .map((s: string) => { const [u, w] = s.split(' '); return { u, w: parseInt(w || '0') }; })
-                .sort((a: any, b: any) => b.w - a.w)[0];
-              if (biggest?.u && biggest.u.startsWith('http')) images.push(biggest.u);
+              const biggest = ss.split(',').map(s => s.trim()).filter(s => s)
+                .map(s => { const [u, w] = s.split(' '); return { u, w: parseInt(w || '0') }; })
+                .sort((a, b) => b.w - a.w)[0];
+              if (biggest && biggest.u && biggest.u.startsWith('http')) images.push(biggest.u);
             }
           });
 
-          const bgImages: string[] = [];
-          el.querySelectorAll('[style*="background"]').forEach((node: any) => {
+          const bgImages = [];
+          el.querySelectorAll('[style*="background"]').forEach(node => {
             const m = (node.style.backgroundImage || '').match(/url\(["']?(https?[^"')]+)["']?\)/);
             if (m && m[1]) bgImages.push(m[1]);
           });
 
-          const videos = Array.from(el.querySelectorAll('video')).map((v: any) => v.src as string).filter(Boolean);
+          const videos = Array.from(el.querySelectorAll('video')).map(v => v.src).filter(Boolean);
 
           const ctaKeys = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'continuar', 'começar', 'ver mais', 'obter', 'inscrever', 'assinar'];
           const ctaLinks = Array.from(el.querySelectorAll('a'))
-            .filter((a: any) => { const t = (a.innerText || '').toLowerCase(); return ctaKeys.some(k => t.includes(k)); })
-            .map((a: any) => realUrl(a.href)).filter((h: any): h is string => h !== null);
-          const allLinks = Array.from(el.querySelectorAll('a')).map((a: any) => realUrl(a.href)).filter((h: any): h is string => h !== null);
-          const waLinks  = Array.from(el.querySelectorAll('a')).map((a: any) => a.href as string).filter((h: string) => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
+            .filter(a => { const t = (a.innerText || '').toLowerCase(); return ctaKeys.some(k => t.includes(k)); })
+            .map(a => realUrl(a.href)).filter(h => h !== null);
+          const allLinks = Array.from(el.querySelectorAll('a')).map(a => realUrl(a.href)).filter(h => h !== null);
+          const waLinks  = Array.from(el.querySelectorAll('a')).map(a => a.href).filter(h => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
           const dateMatch = text.match(/(\d+)\s*de\s*(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/i);
 
           return { text: text.substring(0, 1000), images: [...new Set(images)].slice(0, 3), backgroundImages: bgImages.slice(0, 2), videos: videos.slice(0, 2), hasVideo: videos.length > 0, advertiser, dateText: dateMatch ? dateMatch[0] : null, ctaLinks: ctaLinks.slice(0, 3), links: allLinks.slice(0, 3), waLinks: waLinks.slice(0, 2) };
