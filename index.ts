@@ -25,6 +25,107 @@ const RUN_HOUR_UTC       = 5;
 const MIN_VIDEO_BYTES    = 50_000;
 const MIN_IMAGE_BYTES    = 5_000;
 
+// ─── Browser-side scripts (raw strings — never transformed by esbuild/tsx) ────
+// IMPORTANT: These must remain plain JS strings. Never convert to functions here.
+// tsx/esbuild injects __name() helpers into compiled functions which break in the
+// Playwright browser sandbox. Passing a string bypasses compilation entirely.
+const BROWSER_CARD_JS = `(el) => {
+  var blocked = ['facebook.com','fb.com','instagram.com','play.google.com','apps.apple.com','youtube.com','google.com','apple.com','adjust.com','onelink.to','app.adjust','branch.io'];
+  var realUrl = function(href) {
+    if (!href) return null;
+    if (href.indexOf('l.facebook.com/l.php') !== -1 || href.indexOf('lm.facebook.com') !== -1) {
+      try { var u = new URL(href).searchParams.get('u'); if (u) return decodeURIComponent(u); } catch(e) {}
+      return null;
+    }
+    if (href.indexOf('http') === 0 && !blocked.some(function(d){ return href.indexOf(d) !== -1; })) return href;
+    return null;
+  };
+  var ctaBtns = ['saiba mais','comprar','baixe','quero','acessar','garantir','clique','ver mais','obter','assinar','inscrever','comecar'];
+  var allRoleLinks = Array.from(el.querySelectorAll('a[role="link"]'));
+  var advertiserEl = allRoleLinks.find(function(a) {
+    var t = (a.innerText || '').toLowerCase().trim();
+    return t.length > 0 && t.length < 60 && !ctaBtns.some(function(k){ return t.indexOf(k) !== -1; });
+  }) || null;
+  var advertiser = advertiserEl ? (advertiserEl.innerText || '').trim() : 'Desconhecido';
+  var text = '';
+  el.childNodes.forEach(function(node) {
+    if (node !== advertiserEl && !(node.contains && node.contains(advertiserEl))) {
+      text += node.innerText || node.textContent || '';
+    }
+  });
+  if (!text.trim()) {
+    text = el.innerText || '';
+    if (advertiser && text.indexOf(advertiser) === 0) text = text.slice(advertiser.length);
+  }
+  var images = [];
+  el.querySelectorAll('img').forEach(function(img) {
+    var src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+    if (src && src.indexOf('https://') === 0 && src.indexOf('emoji') === -1 && src.indexOf('static') === -1 && src.length > 50) images.push(src);
+    var ss = img.getAttribute('srcset') || '';
+    if (ss) {
+      var parts = ss.split(',').map(function(s){ return s.trim(); }).filter(Boolean).map(function(s){ var p=s.split(' '); return {u:p[0],w:parseInt(p[1]||'0')}; }).sort(function(a,b){ return b.w-a.w; });
+      if (parts[0] && parts[0].u && parts[0].u.indexOf('http') === 0) images.push(parts[0].u);
+    }
+  });
+  var bgImages = [];
+  el.querySelectorAll('[style*="background"]').forEach(function(node) {
+    var m = (node.style.backgroundImage || '').match(/url\\(["']?(https?[^"')]+)["']?\\)/);
+    if (m && m[1]) bgImages.push(m[1]);
+  });
+  var videos = Array.from(el.querySelectorAll('video')).map(function(v){ return v.src; }).filter(Boolean);
+  var ctaKeys = ['saiba mais','comprar','baixe','quero','acessar','garantir','clique','continuar','comecar','ver mais','obter','inscrever','assinar'];
+  var ctaLinks = Array.from(el.querySelectorAll('a')).filter(function(a){ var t=(a.innerText||'').toLowerCase(); return ctaKeys.some(function(k){ return t.indexOf(k)!==-1; }); }).map(function(a){ return realUrl(a.href); }).filter(function(h){ return h !== null; });
+  var allLinks = Array.from(el.querySelectorAll('a')).map(function(a){ return realUrl(a.href); }).filter(function(h){ return h !== null; });
+  var waLinks = Array.from(el.querySelectorAll('a')).map(function(a){ return a.href; }).filter(function(h){ return h && (h.indexOf('wa.me') !== -1 || h.indexOf('whatsapp.com/send') !== -1); });
+  var dateMatch = text.match(/(\\d+)\\s*de\\s*(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/i);
+  var uniqImages = images.filter(function(v,i,a){ return a.indexOf(v)===i; }).slice(0,3);
+  return { text: text.substring(0,1000), images: uniqImages, backgroundImages: bgImages.slice(0,2), videos: videos.slice(0,2), hasVideo: videos.length > 0, advertiser: advertiser, dateText: dateMatch ? dateMatch[0] : null, ctaLinks: ctaLinks.slice(0,3), links: allLinks.slice(0,3), waLinks: waLinks.slice(0,2) };
+}`;
+
+const BROWSER_PAGE_JS = `() => {
+  var skip = new Set();
+  ['nav','footer','aside','header','[aria-hidden="true"]','[class*="cookie"]','[class*="nav"]','[class*="footer"]','[class*="menu"]','[class*="header"]','script','style','noscript'].forEach(function(sel){ try { document.querySelectorAll(sel).forEach(function(el){ skip.add(el); }); } catch(e){} });
+  var getVisibleText = function(root) {
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, { acceptNode: function(node) {
+      var el = node.parentElement;
+      while (el) {
+        if (skip.has(el)) return NodeFilter.FILTER_REJECT;
+        var s = window.getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return NodeFilter.FILTER_REJECT;
+        el = el.parentElement;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }});
+    var parts = []; var n;
+    while ((n = walker.nextNode())) { var t = (n.textContent || '').trim(); if (t.length > 2) parts.push(t); }
+    return parts.join('\\n');
+  };
+  var mainEl = document.querySelector('main, article, [role="main"], .main, #main, section') || document.body;
+  var rawText = getVisibleText(mainEl);
+  var fullText = document.body.innerText || '';
+  var lower = fullText.toLowerCase();
+  var ogTitleEl = document.querySelector('meta[property="og:title"]');
+  var ogTitle = ogTitleEl ? (ogTitleEl.getAttribute('content') || '') : '';
+  var titleTag = document.title || '';
+  var h1El = document.querySelector('h1');
+  var h1Text = h1El ? (h1El.innerText || '').trim() : '';
+  var pageHtml = document.documentElement.outerHTML.substring(0,5000);
+  var hasVideo = !!(document.querySelector('video') || document.querySelector('iframe[src*="youtube"]') || document.querySelector('iframe[src*="vimeo"]') || document.querySelector('iframe[src*="wistia"]') || document.querySelector('iframe[src*="panda"]'));
+  var vSrcEl = document.querySelector('video source') || document.querySelector('video') || document.querySelector('iframe[src*="panda"]') || document.querySelector('iframe[src*="youtube"]') || document.querySelector('iframe[src*="vimeo"]');
+  var videoSrc = vSrcEl ? (vSrcEl.src || null) : null;
+  var radioInputs = document.querySelectorAll('input[type="radio"]').length;
+  var hasUpsell = lower.indexOf('leve tambem') !== -1 || lower.indexOf('adicione ao pedido') !== -1 || lower.indexOf('aproveite tambem') !== -1;
+  var hasDownsell = (lower.indexOf('espera') !== -1 && (lower.indexOf('sair') !== -1 || lower.indexOf('chance') !== -1)) || lower.indexOf('ultima chance') !== -1;
+  var hasCheckout = lower.indexOf('finalizar compra') !== -1 || lower.indexOf('dados do cartao') !== -1 || lower.indexOf('cartao de credito') !== -1 || lower.indexOf('numero do cartao') !== -1 || lower.indexOf('cvv') !== -1 || lower.indexOf('boleto') !== -1 || lower.indexOf('pix') !== -1;
+  var hasQuizContent = lower.indexOf('quiz') !== -1 || lower.indexOf('proxima pergunta') !== -1 || lower.indexOf('qual e o seu') !== -1 || lower.indexOf('como voce se sente') !== -1;
+  var isQuiz = !hasCheckout && ((radioInputs >= 2 && hasQuizContent) || (lower.indexOf('quiz') !== -1 && !hasCheckout));
+  var hasLongCopy = rawText.length > 500;
+  var ctaKws = ['saiba mais','comprar','baixe','quero','acessar','garantir','clique','proximo','continuar','comecar','inscrever'];
+  var ctaLinks = Array.from(document.querySelectorAll('a, button')).filter(function(el){ var t=(el.innerText||'').toLowerCase(); return ctaKws.some(function(k){ return t.indexOf(k)!==-1; }); }).map(function(el){ return el.href||null; }).filter(function(h){ return !!h && h.indexOf('javascript:') === -1; });
+  var waLinks = Array.from(document.querySelectorAll('a')).map(function(a){ return a.href; }).filter(function(h){ return h && (h.indexOf('wa.me')!==-1 || h.indexOf('whatsapp.com/send')!==-1); });
+  return { rawText: rawText.substring(0,3000), hasVideo: hasVideo, videoSrc: videoSrc, radioInputs: radioInputs, hasUpsell: hasUpsell, hasDownsell: hasDownsell, hasCheckout: hasCheckout, isQuiz: isQuiz, hasLongCopy: hasLongCopy, ctaLinks: ctaLinks.slice(0,3), waLinks: waLinks.slice(0,2), ogTitle: ogTitle, titleTag: titleTag, h1Text: h1Text, pageHtml: pageHtml };
+}`;
+
 const KEYWORD_CATEGORIES: Record<string, string[]> = {
   'PDF':       ['PDF por apenas 9,99', 'PDF por apenas 10', 'PDF por apenas 17', 'PDF por apenas 27', 'PDF por apenas 37', 'PDF por apenas 47'],
   'Receitas':  ['Receitas por apenas 9,99', 'Receitas por apenas 10', 'Receitas por apenas 17', 'Receitas por apenas 27', 'Receitas por apenas 37'],
@@ -824,74 +925,7 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
       const screenshotPath = `funnel_${domain.replace(/[^a-z0-9]/gi, '_')}_${Date.now()}_${depth + 1}.png`;
       await page.screenshot({ path: screenshotPath, fullPage: true });
 
-      const pageData = await page.evaluate(() => {
-        const skip = new Set();
-        ['nav', 'footer', 'aside', 'header', '[aria-hidden="true"]', '[class*="cookie"]',
-         '[class*="nav"]', '[class*="footer"]', '[class*="menu"]', '[class*="header"]',
-         'script', 'style', 'noscript'].forEach(sel => {
-          try { document.querySelectorAll(sel).forEach(el => skip.add(el)); } catch {}
-        });
-
-        const getVisibleText = (root) => {
-          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-            acceptNode: (node) => {
-              let el = node.parentElement;
-              while (el) {
-                if (skip.has(el)) return NodeFilter.FILTER_REJECT;
-                const s = window.getComputedStyle(el);
-                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return NodeFilter.FILTER_REJECT;
-                el = el.parentElement;
-              }
-              return NodeFilter.FILTER_ACCEPT;
-            }
-          });
-          const parts = [];
-          let n;
-          while ((n = walker.nextNode())) { const t = (n.textContent || '').trim(); if (t.length > 2) parts.push(t); }
-          return parts.join('\n');
-        };
-
-        const mainEl = document.querySelector('main, article, [role="main"], .main, #main, section') || document.body;
-        const rawText = getVisibleText(mainEl);
-        const fullText = document.body.innerText || '';
-        const lower = fullText.toLowerCase();
-
-        const ogTitleEl = document.querySelector('meta[property="og:title"]');
-        const ogTitle = ogTitleEl ? ogTitleEl.getAttribute('content') || '' : '';
-        const titleTag = document.title || '';
-        const h1El = document.querySelector('h1');
-        const h1Text = h1El ? (h1El.innerText || '').trim() : '';
-        const pageHtml = document.documentElement.outerHTML.substring(0, 5000);
-
-        const hasVideo = !!(document.querySelector('video') ||
-          document.querySelector('iframe[src*="youtube"]') || document.querySelector('iframe[src*="vimeo"]') ||
-          document.querySelector('iframe[src*="wistia"]') || document.querySelector('iframe[src*="panda"]'));
-
-        const videoSrcEl = document.querySelector('video source') || document.querySelector('video') ||
-          document.querySelector('iframe[src*="panda"]') || document.querySelector('iframe[src*="youtube"]') ||
-          document.querySelector('iframe[src*="vimeo"]');
-        const videoSrc = videoSrcEl ? (videoSrcEl.src || null) : null;
-
-        const radioInputs = document.querySelectorAll('input[type="radio"]').length;
-        const hasUpsell   = lower.includes('leve também') || lower.includes('adicione ao pedido') || lower.includes('aproveite também');
-        const hasDownsell = (lower.includes('espera') && (lower.includes('sair') || lower.includes('chance'))) || lower.includes('última chance');
-        const hasCheckout = lower.includes('finalizar compra') || lower.includes('dados do cartão') || lower.includes('cartão de crédito') || lower.includes('número do cartão') || lower.includes('cvv') || lower.includes('boleto') || lower.includes('pix');
-        const hasQuizContent = lower.includes('quiz') || lower.includes('próxima pergunta') || lower.includes('qual é o seu') || lower.includes('como você se sente');
-        const isQuiz = !hasCheckout && ((radioInputs >= 2 && hasQuizContent) || (lower.includes('quiz') && !hasCheckout));
-        const hasLongCopy = rawText.length > 500;
-
-        const ctaKeywords = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'próximo', 'continuar', 'começar', 'inscrever'];
-        const ctaLinks = Array.from(document.querySelectorAll('a, button'))
-          .filter(el => { const t = (el.innerText || '').toLowerCase(); return ctaKeywords.some(k => t.includes(k)); })
-          .map(el => el.href || null)
-          .filter(h => !!h && !h.includes('javascript:'));
-
-        const waLinks = Array.from(document.querySelectorAll('a'))
-          .map(a => a.href)
-          .filter(h => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
-
-        return { rawText: rawText.substring(0, 3000), hasVideo, videoSrc, radioInputs, hasUpsell, hasDownsell, hasCheckout, isQuiz, hasLongCopy, ctaLinks: ctaLinks.slice(0, 3), waLinks: waLinks.slice(0, 2), ogTitle, titleTag, h1Text, pageHtml };
-      });
+      const pageData = await page.evaluate(BROWSER_PAGE_JS);
 
       const pageType = classifyPage(pageData.rawText, pageData.hasVideo, pageData.radioInputs, realUrl);
       const cleanCopy = extractSalesCopy(pageData.rawText);
@@ -1194,69 +1228,7 @@ async function scrapeKeyword(
         const sponsored = sponsoredLocator.nth(i);
         const card = sponsored.locator('xpath=ancestor::div[.//a[@role="link"]][1]');
 
-        const raw = await card.evaluate((el) => {
-          const blockedDomains = ['facebook.com','fb.com','instagram.com','play.google.com','apps.apple.com','youtube.com','google.com','apple.com','adjust.com','onelink.to','app.adjust','branch.io'];
-
-          const realUrl = (href) => {
-            if (!href) return null;
-            if (href.includes('l.facebook.com/l.php') || href.includes('lm.facebook.com')) {
-              try { const u = new URL(href).searchParams.get('u'); if (u) return decodeURIComponent(u); } catch {}
-              return null;
-            }
-            if (href.startsWith('http') && !blockedDomains.some(d => href.includes(d))) return href;
-            return null;
-          };
-
-          const ctaBtns = ['saiba mais','comprar','baixe','quero','acessar','garantir','clique','ver mais','obter','assinar','inscrever','começar'];
-          const allRoleLinks = Array.from(el.querySelectorAll('a[role="link"]'));
-          const advertiserEl = allRoleLinks.find(a => {
-            const t = (a.innerText || '').toLowerCase().trim();
-            return t.length > 0 && t.length < 60 && !ctaBtns.some(k => t.includes(k));
-          }) || null;
-          const advertiser = advertiserEl ? (advertiserEl.innerText || '').trim() : 'Desconhecido';
-
-          let text = '';
-          el.childNodes.forEach(node => {
-            if (node !== advertiserEl && !node.contains?.(advertiserEl)) {
-              text += node.innerText || node.textContent || '';
-            }
-          });
-          if (!text.trim()) {
-            text = el.innerText || '';
-            if (advertiser && text.startsWith(advertiser)) text = text.slice(advertiser.length);
-          }
-
-          const images = [];
-          el.querySelectorAll('img').forEach(img => {
-            const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
-            if (src && src.startsWith('https://') && !src.includes('emoji') && !src.includes('static') && src.length > 50) images.push(src);
-            const ss = img.getAttribute('srcset') || '';
-            if (ss) {
-              const biggest = ss.split(',').map(s => s.trim()).filter(s => s)
-                .map(s => { const [u, w] = s.split(' '); return { u, w: parseInt(w || '0') }; })
-                .sort((a, b) => b.w - a.w)[0];
-              if (biggest && biggest.u && biggest.u.startsWith('http')) images.push(biggest.u);
-            }
-          });
-
-          const bgImages = [];
-          el.querySelectorAll('[style*="background"]').forEach(node => {
-            const m = (node.style.backgroundImage || '').match(/url\(["']?(https?[^"')]+)["']?\)/);
-            if (m && m[1]) bgImages.push(m[1]);
-          });
-
-          const videos = Array.from(el.querySelectorAll('video')).map(v => v.src).filter(Boolean);
-
-          const ctaKeys = ['saiba mais', 'comprar', 'baixe', 'quero', 'acessar', 'garantir', 'clique', 'continuar', 'começar', 'ver mais', 'obter', 'inscrever', 'assinar'];
-          const ctaLinks = Array.from(el.querySelectorAll('a'))
-            .filter(a => { const t = (a.innerText || '').toLowerCase(); return ctaKeys.some(k => t.includes(k)); })
-            .map(a => realUrl(a.href)).filter(h => h !== null);
-          const allLinks = Array.from(el.querySelectorAll('a')).map(a => realUrl(a.href)).filter(h => h !== null);
-          const waLinks  = Array.from(el.querySelectorAll('a')).map(a => a.href).filter(h => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
-          const dateMatch = text.match(/(\d+)\s*de\s*(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/i);
-
-          return { text: text.substring(0, 1000), images: [...new Set(images)].slice(0, 3), backgroundImages: bgImages.slice(0, 2), videos: videos.slice(0, 2), hasVideo: videos.length > 0, advertiser, dateText: dateMatch ? dateMatch[0] : null, ctaLinks: ctaLinks.slice(0, 3), links: allLinks.slice(0, 3), waLinks: waLinks.slice(0, 2) };
-        });
+        const raw = await card.evaluate(BROWSER_CARD_JS);
 
         rawCards.push(raw);
       } catch (err) { console.error(`Card ${i} read error:`, err); }
