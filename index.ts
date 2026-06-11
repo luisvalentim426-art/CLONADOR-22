@@ -8,7 +8,7 @@ import * as dotenv from 'dotenv';
 
 dotenv.config();
 
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN!, { polling: false });
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN!, { polling: true });
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -16,6 +16,7 @@ const MAX_ADS_COLLECT    = 15;
 const MAX_ADS_SEND       = 10;
 const KEYWORD_GAP_MS     = 15 * 60 * 1000;
 const HISTORY_FILE       = 'history.json';
+const DETAILED_HISTORY_FILE = 'detailed_history.json';
 const PROGRESS_FILE      = 'progress.json';
 const HISTORY_TTL_MS     = 23 * 60 * 60 * 1000;
 const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -38,8 +39,37 @@ const KEYWORD_CATEGORIES: Record<string, string[]> = {
   'Baixe':     ['Baixe agora por apenas 9,99', 'Baixe agora por apenas 10', 'Baixe agora por apenas 17'],
 };
 
-// CORRECÇÃO 1: Removido Moçambique — apenas Brasil
+// Black / PLR digital — only run on last day of rotation, after all low-ticket finish
+const BLACK_PLR_CATEGORIES: Record<string, string[]> = {
+  'BlackPLR': [
+    'Choquei', 'Antes e depois', 'Promoção', 'Oferta', '90 off',
+    'Últimas vagas', 'Só até meia-noite', 'Acaba hoje', 'Restam poucas unidades',
+    'Não perca', 'Emagreça kg em', 'Ganhe R$', 'Fature em casa',
+    'Sem precisar de', 'Do zero a', 'Cansado de', 'Chega de',
+    'Você já tentou', 'Por que você ainda', 'Mais de pessoas já',
+    'Funciona mesmo para', 'Resultados reais', 'Para quem é iniciante',
+    'Para mães que', 'Para quem não tem tempo',
+  ],
+};
+
 const COUNTRIES = ['BR'];
+const MZ_COUNTRY = 'MZ';
+
+// Domains that should never be followed as funnel targets
+const FUNNEL_DOMAIN_BLACKLIST = [
+  'facebook.com', 'fb.com', 'instagram.com', 'google.com', 'youtube.com',
+  'twitter.com', 'x.com', 'tiktok.com', 'amazon.com', 'amazon.com.br',
+  'ebay.com', 'mercadolivre.com', 'mercadolibre.com', 'olx.com.br',
+  'olx.pt', 'linkedin.com', 'pinterest.com', 'reddit.com',
+  'play.google.com', 'apps.apple.com', 'apple.com',
+  'adjust.com', 'onelink.to', 'branch.io', 'firebase.com',
+  'wa.me', 'whatsapp.com', 'l.facebook.com', 'lm.facebook.com',
+  'bit.ly', 'tinyurl.com', 'shorturl.at', 'cutt.ly',
+];
+
+// Mozambique: just detect tech + checkout presence, no price filter
+const MZ_TECH_PATTERNS  = ['lovable', 'vercel', 'bolt.new', 'bolt.diy'];
+const MZ_CHECKOUT_PATTERNS = ['escalepay', 'escale.pay', 'ratixpay', 'ratix.pay', 'lojou', 'kambafy', 'zenofy'];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -75,6 +105,10 @@ interface ScoredAd {
   funnelComplexity: 'simples' | 'médio' | 'avançado';
   performanceConfidence: 'baixo' | 'médio' | 'alto';
   recommendationLevel: string;
+  offerTitle: string;   // real product name extracted from funnel page
+  isMozambique?: boolean;
+  mzTech?: string;
+  mzCheckout?: string;
 }
 
 interface OfferAnalysis {
@@ -85,6 +119,72 @@ interface OfferAnalysis {
   hasRecurring: boolean;
   hasGuarantee: boolean;
   ctaStrength: 'fraco' | 'médio' | 'forte';
+}
+
+// ─── Bot state (for Telegram commands) ────────────────────────────────────────
+
+let botRunning             = false;
+let currentKeyword: string | null = null;
+let nextKeywordHint: string | null = null;  // upcoming keyword name for /proxima display
+let offersFoundToday       = 0;
+let skipCurrentKeyword     = false;
+let waitUntilMs: number | null = null;
+let skipWaitUntilNextRun   = false;
+
+// Global in-memory dedup history — reset by /resetarsemana without needing a file delete
+let globalHistory: History = {};
+
+// ─── Detailed History (for /historico) ────────────────────────────────────────
+
+interface DetailedHistoryEntry {
+  date: string;
+  keyword: string;
+  country: string;
+  advertiser: string;
+  offerTitle: string;
+  score: number;
+  funnelUrl: string;
+  platform: string;
+  funnelType: string;
+  offerAngle: string;
+  origin?: 'auto' | 'url_manual';
+  analyzedAt?: number;
+}
+
+function loadDetailedHistory(): DetailedHistoryEntry[] {
+  try {
+    if (fs.existsSync(DETAILED_HISTORY_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(DETAILED_HISTORY_FILE, 'utf8'));
+      return Array.isArray(raw) ? raw : [];
+    }
+  } catch {}
+  return [];
+}
+
+function saveDetailedHistory(entries: DetailedHistoryEntry[]) {
+  try {
+    const trimmed = entries.slice(-200);
+    fs.writeFileSync(DETAILED_HISTORY_FILE, JSON.stringify(trimmed, null, 2));
+  } catch {}
+}
+
+function appendDetailedHistory(ad: ScoredAd, origin: 'auto' | 'url_manual' = 'auto') {
+  const entries = loadDetailedHistory();
+  entries.push({
+    date: new Date().toISOString().split('T')[0],
+    keyword: ad.keyword,
+    country: ad.country,
+    advertiser: ad.advertiser,
+    offerTitle: ad.offerTitle,
+    score: ad.score,
+    funnelUrl: ad.funnelUrl,
+    platform: ad.platform,
+    funnelType: ad.funnelType,
+    offerAngle: ad.offerAngle,
+    origin,
+    analyzedAt: Date.now(),
+  });
+  saveDetailedHistory(entries);
 }
 
 // ─── History ──────────────────────────────────────────────────────────────────
@@ -141,6 +241,7 @@ interface Progress {
   runDate: string;
   todayCategories: string[];
   completedToday: string[];
+  rotationDay: number;
 }
 
 function todayUTC(): string {
@@ -151,11 +252,16 @@ function loadProgress(): Progress {
   try {
     if (fs.existsSync(PROGRESS_FILE)) return JSON.parse(fs.readFileSync(PROGRESS_FILE, 'utf8'));
   } catch {}
-  return { nextCategoryIndex: 0, runDate: '', todayCategories: [], completedToday: [] };
+  return { nextCategoryIndex: 0, runDate: '', todayCategories: [], completedToday: [], rotationDay: 0 };
 }
 
 function saveProgress(p: Progress) {
   try { fs.writeFileSync(PROGRESS_FILE, JSON.stringify(p, null, 2)); } catch {}
+}
+
+function isLastDayOfRotation(p: Progress): boolean {
+  const totalCats = ALL_CATEGORY_NAMES.length;
+  return (p.nextCategoryIndex + CATEGORIES_PER_DAY) >= totalCats;
 }
 
 function planTodayCategories(p: Progress): Progress {
@@ -168,11 +274,13 @@ function planTodayCategories(p: Progress): Progress {
   for (let i = 0; i < CATEGORIES_PER_DAY; i++) {
     cats.push(ALL_CATEGORY_NAMES[(p.nextCategoryIndex + i) % n]);
   }
+  const newRotationDay = (p.rotationDay || 0) + 1;
   const next: Progress = {
     nextCategoryIndex: (p.nextCategoryIndex + CATEGORIES_PER_DAY) % n,
     runDate: today,
     todayCategories: cats,
     completedToday: [],
+    rotationDay: newRotationDay,
   };
   saveProgress(next);
   return next;
@@ -186,9 +294,17 @@ async function waitUntilNextRun() {
   const ms = next.getTime() - now.getTime();
   const h  = Math.floor(ms / 3600000);
   const m  = Math.floor((ms % 3600000) / 60000);
+  waitUntilMs = next.getTime();
+  skipWaitUntilNextRun = false;
   console.log(`[SCHEDULE] Sleeping ${h}h ${m}m until 05:00 UTC`);
   await sendToTelegram(`⏰ <b>Análise diária concluída.</b>\nPróxima execução em <b>${h}h ${m}m</b> (05:00 UTC / 07:00 Moçambique).`);
-  await delay(ms);
+  // Interruptible wait — /proximodia can break out early
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (skipWaitUntilNextRun) { skipWaitUntilNextRun = false; break; }
+    await delay(5000);
+  }
+  waitUntilMs = null;
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -235,13 +351,40 @@ async function sendVideo(filePath: string, caption: string) {
     if (!fs.existsSync(filePath)) return;
     const stat = fs.statSync(filePath);
     if (stat.size < MIN_VIDEO_BYTES) { fs.unlinkSync(filePath); return; }
-    await bot.sendVideo(CHAT_ID, filePath, { caption: caption.substring(0, 1024) });
+    try {
+      await bot.sendVideo(CHAT_ID, filePath, { caption: caption.substring(0, 1024) });
+    } catch (videoErr: any) {
+      const errStr = String(videoErr?.message || videoErr || '');
+      if (errStr.includes('400') || errStr.includes('VIDEO_INVALID')) {
+        try { await bot.sendDocument(CHAT_ID, filePath, { caption: caption.substring(0, 1024) }); }
+        catch {}
+      } else { throw videoErr; }
+    }
     fs.unlinkSync(filePath);
   } catch (err) { console.error('Video error:', err); safeDelete(filePath); }
 }
 
 function safeDelete(filePath: string) {
   try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+}
+
+// Normalize a URL for deduplication: keep host+path, strip query params and tracking tokens
+function normalizeUrlForDedup(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    const path = u.pathname.toLowerCase().replace(/\/$/, '');
+    return `${u.hostname.toLowerCase()}${path}`;
+  } catch {
+    return url.toLowerCase().substring(0, 150);
+  }
+}
+
+function isDomainBlacklisted(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return FUNNEL_DOMAIN_BLACKLIST.some(d => hostname === d || hostname.endsWith('.' + d));
+  } catch { return false; }
 }
 
 function downloadFile(url: string, dest: string, minBytes = 0, depth = 0): Promise<boolean> {
@@ -320,12 +463,34 @@ function detectPlatform(url: string, text: string): string {
   if (u.includes('hotmart') || t.includes('hotmart'))         return 'Hotmart';
   if (u.includes('kiwify') || t.includes('kiwify'))           return 'Kiwify';
   if (u.includes('eduzz') || t.includes('eduzz'))             return 'Eduzz';
+  if (u.includes('cakto') || t.includes('cakto'))             return 'Cakto';
+  if (u.includes('kirvano') || t.includes('kirvano'))         return 'Kirvano';
+  if (u.includes('perfectpay') || t.includes('perfectpay') || u.includes('perfect-pay') || t.includes('perfect pay')) return 'Perfect Pay';
+  if (u.includes('zenofy') || t.includes('zenofy'))           return 'Zenofy';
   if (u.includes('monetizze') || t.includes('monetizze'))     return 'Monetizze';
   if (u.includes('pepper.com') || t.includes('pepper'))       return 'Pepper';
   if (u.includes('braip') || t.includes('braip'))             return 'Braip';
   if (u.includes('wa.me') || u.includes('whatsapp'))          return 'WhatsApp';
   if (u.includes('/checkout') || u.includes('pay.'))          return 'Checkout direto';
   return 'Direto';
+}
+
+function detectTechnology(url: string, html: string): string {
+  const u = url.toLowerCase(), h = html.toLowerCase();
+  if (u.includes('lovable') || h.includes('lovable'))         return 'Lovable';
+  if (u.includes('bolt.new') || u.includes('bolt.diy') || h.includes('bolt.new')) return 'Bolt';
+  if (u.includes('vercel.app') || h.includes('_next/static') || h.includes('vercel')) return 'Vercel';
+  return '';
+}
+
+function detectMzCheckout(url: string, text: string): string {
+  const u = url.toLowerCase(), t = text.toLowerCase();
+  if (u.includes('escalepay') || t.includes('escale pay') || t.includes('escalepay')) return 'Escale Pay';
+  if (u.includes('ratixpay') || t.includes('ratix pay') || t.includes('ratixpay'))   return 'Ratix Pay';
+  if (u.includes('lojou') || t.includes('lojou'))             return 'Lojou';
+  if (u.includes('kambafy') || t.includes('kambafy'))         return 'Kambafy';
+  if (u.includes('zenofy') || t.includes('zenofy'))           return 'Zenofy';
+  return '';
 }
 
 function classifyPage(text: string, hasVideo: boolean, radioInputs: number, url: string): string {
@@ -493,6 +658,7 @@ async function sendComparisonTable(ads: ScoredAd[], keyword: string, country: st
     const a = ads[i];
     const badge = i === 0 ? '🏆' : `#${i + 1}`;
     table += `${badge} <b>${a.advertiser.substring(0, 25)}</b>\n`;
+    table += `   Produto: ${a.offerTitle.substring(0, 50)}\n`;
     table += `   Ângulo: ${a.offerAngle} | Estilo: ${a.creativeStyle}\n`;
     table += `   Complexidade: ${a.funnelComplexity} | Preço: ${a.price}\n`;
     table += `   Recomendação: <b>${a.recommendationLevel}</b>\n\n`;
@@ -500,7 +666,7 @@ async function sendComparisonTable(ads: ScoredAd[], keyword: string, country: st
 
   const best = ads[0];
   table += `\n🏆 <b>MELHOR OFERTA PARA CLONAR:</b>\n`;
-  table += `<b>${best.advertiser}</b>\n`;
+  table += `<b>${best.advertiser}</b> — ${best.offerTitle.substring(0, 60)}\n`;
   table += `Score ${best.score}/10 | ${best.offerAngle} | ${best.creativeStyle}\n`;
   table += `Funil: ${best.funnelComplexity} | Confiança: ${best.performanceConfidence}\n`;
   table += `CTA: ${best.offerAnalysis.ctaStrength} | Plataforma: ${best.platform}`;
@@ -545,25 +711,61 @@ function extractSalesCopy(rawText: string, advertiserName?: string): string {
   return out.slice(0, 18).join('\n');
 }
 
+// Extract the real offer title from funnel page metadata / headings
+function extractRealOfferTitle(pageHtml: string, h1Text: string, ogTitle: string, titleTag: string): string {
+  const cta = ['saiba mais', 'comprar', 'baixe agora', 'quero', 'acessar', 'garantir', 'clique aqui',
+               'ver mais', 'obter', 'assinar', 'clique aqui', 'clique aqui para', 'continue',
+               'avançar', 'próximo', 'sim, quero', 'quero agora'];
+  const fbNoise = ['biblioteca de anúncios', 'facebook', 'meta ads', 'ad library', 'patrocinado'];
+
+  const candidates = [ogTitle, h1Text, titleTag].map(s => s?.trim() || '');
+  for (const c of candidates) {
+    if (!c) continue;
+    const lower = c.toLowerCase();
+    if (cta.some(k => lower === k || lower.startsWith(k + ' '))) continue;
+    if (fbNoise.some(k => lower.includes(k))) continue;
+    if (c.length > 3 && c.length < 150) return c;
+  }
+  return 'Título não encontrado';
+}
+
 async function downloadCreative(rawCard: any): Promise<{ path: string | null; isVideo: boolean }> {
+  // Video first: try all video sources
   if (rawCard.videos && rawCard.videos.length > 0) {
     for (const videoUrl of rawCard.videos) {
       if (!videoUrl || !videoUrl.startsWith('http')) continue;
       const p = `creative_${Date.now()}.mp4`;
       const ok = await downloadFile(videoUrl, p, MIN_VIDEO_BYTES);
-      if (ok) return { path: p, isVideo: true };
+      if (ok) {
+        // Validate mp4 header
+        try {
+          const buf = Buffer.alloc(12);
+          const fd = fs.openSync(p, 'r');
+          fs.readSync(fd, buf, 0, 12, 0);
+          fs.closeSync(fd);
+          const isMp4 = buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70;
+          const isOther = buf[0] === 0x1a || buf[0] === 0x00;
+          if (!isMp4 && !isOther) { fs.unlinkSync(p); continue; }
+        } catch { safeDelete(p); continue; }
+        return { path: p, isVideo: true };
+      }
     }
   }
 
+  // Images: prefer highest resolution via srcset width values
   const candidates: string[] = [
     ...(rawCard.images || []),
     ...(rawCard.backgroundImages || []),
   ].filter((u: string) => u && u.startsWith('http'));
 
+  // Sort by width hint in URL params (higher = better quality)
   candidates.sort((a: string, b: string) => {
     const wa = parseInt(new URLSearchParams(a.split('?')[1] || '').get('_nc_ht') || '0');
     const wb = parseInt(new URLSearchParams(b.split('?')[1] || '').get('_nc_ht') || '0');
-    return wb - wa;
+    // Also sort by any width/height params
+    const sa = parseInt(new URLSearchParams(a.split('?')[1] || '').get('width') || '0');
+    const sb = parseInt(new URLSearchParams(b.split('?')[1] || '').get('width') || '0');
+    return (wb + sb) - (wa + sa);
   });
 
   for (const imgUrl of candidates) {
@@ -619,7 +821,7 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
       const realUrl = page.url();
       const domain = (() => { try { return new URL(realUrl).hostname; } catch { return realUrl; } })();
 
-      const screenshotPath = `step_${depth + 1}_${Date.now()}.png`;
+      const screenshotPath = `funnel_${domain.replace(/[^a-z0-9]/gi, '_')}_${Date.now()}_${depth + 1}.png`;
       await page.screenshot({ path: screenshotPath, fullPage: true });
 
       const pageData = await page.evaluate(() => {
@@ -654,6 +856,12 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
         const fullText = document.body.innerText || '';
         const lower = fullText.toLowerCase();
 
+        // Extract real offer title: og:title > <title> > h1
+        const ogTitle = (document.querySelector('meta[property="og:title"]') as HTMLMetaElement)?.content || '';
+        const titleTag = document.title || '';
+        const h1Text = (document.querySelector('h1') as HTMLElement)?.innerText?.trim() || '';
+        const pageHtml = document.documentElement.outerHTML.substring(0, 5000);
+
         const hasVideo = !!(document.querySelector('video') ||
           document.querySelector('iframe[src*="youtube"]') || document.querySelector('iframe[src*="vimeo"]') ||
           document.querySelector('iframe[src*="wistia"]') || document.querySelector('iframe[src*="panda"]'));
@@ -683,14 +891,16 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
           .map((a: any) => a.href as string)
           .filter((h: string) => h && (h.includes('wa.me') || h.includes('whatsapp.com/send')));
 
-        return { rawText: rawText.substring(0, 3000), hasVideo, videoSrc, radioInputs, hasUpsell, hasDownsell, hasCheckout, isQuiz, hasLongCopy, ctaLinks: ctaLinks.slice(0, 3), waLinks: waLinks.slice(0, 2) };
+        return { rawText: rawText.substring(0, 3000), hasVideo, videoSrc, radioInputs, hasUpsell, hasDownsell, hasCheckout, isQuiz, hasLongCopy, ctaLinks: ctaLinks.slice(0, 3), waLinks: waLinks.slice(0, 2), ogTitle, titleTag, h1Text, pageHtml };
       });
 
       const pageType = classifyPage(pageData.rawText, pageData.hasVideo, pageData.radioInputs, realUrl);
       const cleanCopy = extractSalesCopy(pageData.rawText);
       const platform  = detectPlatform(realUrl, pageData.rawText);
+      const technology = detectTechnology(realUrl, pageData.pageHtml || '');
+      const offerTitle = extractRealOfferTitle(pageData.pageHtml || '', pageData.h1Text, pageData.ogTitle, pageData.titleTag);
 
-      steps.push({ url: realUrl, domain, type: pageType, screenshotPath, videoSrc: pageData.videoSrc, hasVideo: pageData.hasVideo, hasUpsell: pageData.hasUpsell, hasDownsell: pageData.hasDownsell, hasCheckout: pageData.hasCheckout, isQuiz: pageData.isQuiz, hasLongCopy: pageData.hasLongCopy, copy: cleanCopy, platform, rawText: pageData.rawText.substring(0, 1000) });
+      steps.push({ url: realUrl, domain, type: pageType, screenshotPath, videoSrc: pageData.videoSrc, hasVideo: pageData.hasVideo, hasUpsell: pageData.hasUpsell, hasDownsell: pageData.hasDownsell, hasCheckout: pageData.hasCheckout, isQuiz: pageData.isQuiz, hasLongCopy: pageData.hasLongCopy, copy: cleanCopy, platform, technology, offerTitle, rawText: pageData.rawText.substring(0, 1000) });
 
       let nextUrl: string | null = null;
       if (pageData.waLinks.length > 0)       nextUrl = pageData.waLinks[0];
@@ -732,11 +942,21 @@ async function collectAd(
 
     const funnelUrl: string | null = rawCard.ctaLinks?.[0] || rawCard.links?.[0] || null;
     const landingDomain = (() => { try { return new URL(funnelUrl || '').hostname; } catch { return ''; } })();
-    const histKey = `${rawCard.advertiser.toLowerCase()}||${landingDomain}`;
+
+    // Dedup key: use normalized URL path (advertiser-agnostic) so same advertiser can
+    // appear for DIFFERENT products/keywords without being blocked
+    const normalizedUrl = normalizeUrlForDedup(funnelUrl);
+    const histKey = normalizedUrl || `${rawCard.advertiser.toLowerCase()}||${landingDomain}`;
 
     if (funnelUrl && wasRecentlyAnalyzed(history, histKey)) {
-      console.log(`[SKIP history] ${rawCard.advertiser} — ${landingDomain}`);
+      console.log(`[SKIP dedup] ${histKey}`);
       return null;
+    }
+
+    // Blacklisted domains: skip funnel crawl, but keep the ad (don't discard it)
+    const funnelBlacklisted = funnelUrl ? isDomainBlacklisted(funnelUrl) : false;
+    if (funnelBlacklisted) {
+      console.log(`[BLACKLIST] Will skip funnel crawl for: ${landingDomain}`);
     }
 
     const priceNum = extractPrice(rawCard.text);
@@ -745,8 +965,16 @@ async function collectAd(
     const creative = await downloadCreative(rawCard);
 
     let funnelStepData: any[] = [];
-    if (funnelUrl && !funnelUrl.includes('facebook.com')) {
-      funnelStepData = await crawlFunnel(context, funnelUrl);
+    if (funnelUrl && !funnelUrl.includes('facebook.com') && !funnelBlacklisted) {
+      console.log(`[CRAWL] Accessing: ${funnelUrl}`);
+      try {
+        funnelStepData = await crawlFunnel(context, funnelUrl);
+        console.log(`[CRAWL] OK — ${funnelStepData.length} step(s) from ${funnelUrl}`);
+      } catch (crawlErr) {
+        console.error(`[CRAWL] Failed: ${funnelUrl}`, crawlErr);
+      }
+    } else if (funnelUrl && !funnelBlacklisted) {
+      console.log(`[CRAWL] Skipped (Facebook link): ${funnelUrl}`);
     }
 
     const hasVSL      = funnelStepData.some(s => s.type === 'VSL') || rawCard.hasVideo;
@@ -767,6 +995,19 @@ async function collectAd(
 
     const offerAngle    = detectOfferAngle(cleanCopy, allFunnelText);
     const creativeStyle = detectCreativeStyle(rawCard.hasVideo, (rawCard.images || []).length, rawCard.text);
+
+    // Real offer title: prefer first page's og:title / title / h1, then fall back to analyzeOffer
+    // Never use Facebook copy or CTA text as the title
+    const rawOfferTitle = funnelStepData.length > 0 ? (funnelStepData[0].offerTitle || '') : '';
+    const isPlaceholder = !rawOfferTitle || rawOfferTitle === 'Título não encontrado';
+    const offerTitle = isPlaceholder
+      ? (offerAnalysis.product && offerAnalysis.product.length > 4 ? offerAnalysis.product : 'Título não encontrado')
+      : rawOfferTitle;
+
+    // Mozambique-specific detection
+    const allTech = funnelStepData.map((s: any) => s.technology || '').join(' ');
+    const mzTech = MZ_TECH_PATTERNS.find(p => allTech.toLowerCase().includes(p) || (funnelUrl || '').toLowerCase().includes(p)) || '';
+    const mzCheckout = detectMzCheckout(funnelUrl || '', allFunnelText);
 
     const partial = {
       hasVSL, hasQuiz, hasUpsell, hasDownsell,
@@ -807,8 +1048,14 @@ async function collectAd(
       creativeStyle,
       funnelComplexity,
       performanceConfidence,
+      offerTitle,
+      isMozambique: country === MZ_COUNTRY,
+      mzTech,
+      mzCheckout,
     };
     const ad: ScoredAd = { ...baseAd, recommendationLevel: computeRecommendationLevel(baseAd as ScoredAd) };
+
+    appendDetailedHistory(ad);
     return ad;
   } catch (err) {
     console.error('collectAd error:', err);
@@ -830,18 +1077,33 @@ async function sendAdReport(ad: ScoredAd, rank: number, isBest: boolean) {
   const offer   = ad.offerAnalysis;
   const confIcon = ad.performanceConfidence === 'alto' ? '🟢' : ad.performanceConfidence === 'médio' ? '🟡' : '🔴';
   const cplxIcon = ad.funnelComplexity === 'avançado' ? '🔷' : ad.funnelComplexity === 'médio' ? '🔹' : '⬜';
+
+  // Mozambique special report
+  if (ad.isMozambique) {
+    await sendToTelegram(`\
+🗺️ <b>#${rank} | MOÇAMBIQUE 🇲🇿 | ${ad.keyword}</b>${bestHeader}${dupNote}
+
+🏢 <b>Anunciante:</b> ${ad.advertiser}
+📦 <b>Produto:</b> ${ad.offerTitle}
+🛠️ <b>Tecnologia detectada:</b> ${ad.mzTech || 'Não identificada'}
+🛒 <b>Checkout detectado:</b> ${ad.mzCheckout || 'Não identificado'}
+🏪 <b>Plataforma:</b> ${ad.platform}
+🔗 <b>Funil:</b> ${ad.funnelUrl}`);
+    return;
+  }
+
   await sendToTelegram(`\
 🎯 <b>#${rank} | ${ad.keyword} | ${countryName}</b>${bestHeader}${dupNote}
 
 ⭐ <b>Score: ${ad.score}/10</b> | ${confIcon} Confiança: <b>${ad.performanceConfidence}</b>
 🏢 <b>Anunciante:</b> ${ad.advertiser}
+📦 <b>Produto:</b> ${ad.offerTitle}
 💰 <b>Preço:</b> ${ad.price}
 🎨 <b>Criativo:</b> ${ad.creativeType} — ${ad.creativeStyle}
 🏪 <b>Plataforma:</b> ${ad.platform}
 📅 <b>Data início:</b> ${ad.dateText || 'Desconhecida'}
 
 🎭 <b>Ângulo da oferta:</b> ${ad.offerAngle}
-📦 <b>OFERTA:</b> ${offer.product}
 💡 <b>Promessa:</b> ${offer.mainPromise}
 ${offer.hasBonus ? '🎁 Bônus: ✅' : ''} ${offer.hasUrgency ? '⏰ Urgência: ✅' : ''} ${offer.hasGuarantee ? '🛡️ Garantia: ✅' : ''} ${offer.hasRecurring ? '🔄 Recorrente: ✅' : ''}
 💪 <b>CTA:</b> ${offer.ctaStrength}
@@ -892,6 +1154,7 @@ async function scrapeKeyword(
   history: History,
   keywordScores: Map<string, number[]>
 ): Promise<ScoredAd[]> {
+  currentKeyword = `${keyword} (${country})`;
   const countryName = country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿';
   const searchUrl   = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=${country}&q=${encodeURIComponent(keyword)}&search_type=keyword_unordered`;
 
@@ -933,7 +1196,6 @@ async function scrapeKeyword(
         const card = sponsored.locator('xpath=ancestor::div[.//a[@role="link"]][1]');
 
         const raw = await card.evaluate((el: HTMLElement) => {
-          // CORRECÇÃO 3: Bloquear domínios irrelevantes no funil
           const blockedDomains = ['facebook.com','fb.com','instagram.com','play.google.com','apps.apple.com','youtube.com','google.com','apple.com','adjust.com','onelink.to','app.adjust','branch.io'];
 
           function realUrl(href: string): string | null {
@@ -946,7 +1208,6 @@ async function scrapeKeyword(
             return null;
           }
 
-          // CORRECÇÃO 2: Não usar botão CTA como anunciante
           const ctaBtns = ['saiba mais','comprar','baixe','quero','acessar','garantir','clique','ver mais','obter','assinar','inscrever','começar'];
           const allRoleLinks = Array.from(el.querySelectorAll('a[role="link"]')) as HTMLElement[];
           const advertiserEl = allRoleLinks.find(a => {
@@ -966,7 +1227,6 @@ async function scrapeKeyword(
             if (advertiser && text.startsWith(advertiser)) text = text.slice(advertiser.length);
           }
 
-          // CORRECÇÃO 4: Aceitar imagens de qualquer domínio, não só fbcdn
           const images: string[] = [];
           el.querySelectorAll('img').forEach((img: any) => {
             const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
@@ -1009,7 +1269,10 @@ async function scrapeKeyword(
     const scored: ScoredAd[] = [];
     for (const raw of dedupedCards) {
       const result = await collectAd(context, raw, keyword, country, history);
-      if (result) scored.push(result);
+      if (result) {
+        scored.push(result);
+        offersFoundToday++;
+      }
       await delay(1500);
     }
 
@@ -1026,7 +1289,7 @@ async function scrapeKeyword(
     topAds.forEach(a => keywordScores.get(kKey)!.push(a.score));
 
     const rankingLines = topAds.map((a, i) => `${i + 1}. <b>${a.advertiser}</b> — ${a.score}/10${a.similarCount > 1 ? ` (${a.similarCount} ads similares)` : ''}`).join('\n');
-    await sendToTelegram(`📊 <b>RANKING — ${keyword} | ${countryName}</b>\n${rankingLines}\n\n🏆 Melhor para clonar: <b>${topAds[0].advertiser}</b>`);
+    await sendToTelegram(`📊 <b>RANKING — ${keyword} | ${countryName}</b>\n${rankingLines}\n\n🏆 Melhor para clonar: <b>${topAds[0].advertiser}</b> — ${topAds[0].offerTitle.substring(0, 50)}`);
 
     for (let i = 0; i < topAds.length; i++) {
       await sendAdReport(topAds[i], i + 1, i === 0);
@@ -1043,6 +1306,8 @@ async function scrapeKeyword(
   } catch (err) {
     console.error(`Keyword error "${keyword}":`, err);
     return [];
+  } finally {
+    currentKeyword = null;
   }
 }
 
@@ -1230,12 +1495,15 @@ async function runCycle(
 
   try {
     for (const category of categoriesToRun) {
-      const keywords = KEYWORD_CATEGORIES[category];
+      const keywords = KEYWORD_CATEGORIES[category] || BLACK_PLR_CATEGORIES[category];
       if (!keywords) continue;
 
-      for (const country of COUNTRIES) {
+      const isBlackPLR = !!BLACK_PLR_CATEGORIES[category];
+      const runCountries = isBlackPLR ? [MZ_COUNTRY, ...COUNTRIES] : COUNTRIES;
+
+      for (const country of runCountries) {
         const countryName = country === 'BR' ? 'Brasil 🇧🇷' : 'Moçambique 🇲🇿';
-        await sendToTelegram(`\n📂 <b>CATEGORIA: ${category}</b> | ${countryName}`);
+        await sendToTelegram(`\n📂 <b>CATEGORIA: ${category}</b>${isBlackPLR ? ' 🖤 Black/PLR' : ''} | ${countryName}`);
 
         const context = await browser.newContext({
           locale: country === 'BR' ? 'pt-BR' : 'pt-MZ',
@@ -1244,14 +1512,44 @@ async function runCycle(
         });
         const page = await context.newPage();
 
-        for (const keyword of keywords) {
+        for (let kwIdx = 0; kwIdx < keywords.length; kwIdx++) {
+          const keyword = keywords[kwIdx];
+          nextKeywordHint = keywords[kwIdx + 1] ?? null;  // pre-announce next keyword
+
           const kwAds = await scrapeKeyword(keyword, country, context, page, history, keywordScores);
           allAds.push(...kwAds);
 
-          console.log(`[WAIT] 15 min before next keyword...`);
-          await sendToTelegram(`⏱️ Aguardando 15 min antes da próxima keyword...`);
-          await delay(KEYWORD_GAP_MS);
+          // If /proxima was pressed during this keyword's analysis, skip the wait
+          if (skipCurrentKeyword) {
+            skipCurrentKeyword = false;
+            const nextKw = nextKeywordHint || '(próxima categoria)';
+            console.log(`[SKIP] /proxima — jumping to: ${nextKw}`);
+            if (kwIdx + 1 < keywords.length) {
+              await sendToTelegram(`⏭️ <b>A avançar para próxima palavra-chave:</b> <b>${nextKw}</b>`);
+            }
+            continue;
+          }
+
+          // Last keyword in category — no gap needed
+          if (kwIdx === keywords.length - 1) continue;
+
+          const nextKw = nextKeywordHint || '(próxima)';
+          console.log(`[WAIT] 15 min before next keyword: ${nextKw}`);
+          await sendToTelegram(`⏱️ Aguardando 15 min antes da próxima keyword: <b>${nextKw}</b>`);
+
+          // Interruptible wait: check skipCurrentKeyword every 5 seconds
+          const gapEnd = Date.now() + KEYWORD_GAP_MS;
+          while (Date.now() < gapEnd) {
+            if (skipCurrentKeyword) {
+              skipCurrentKeyword = false;
+              const nk = nextKeywordHint || '(próxima categoria)';
+              await sendToTelegram(`⏭️ <b>A avançar para próxima palavra-chave:</b> <b>${nk}</b>`);
+              break;
+            }
+            await delay(5000);
+          }
         }
+        nextKeywordHint = null;
 
         await context.close();
       }
@@ -1263,15 +1561,374 @@ async function runCycle(
   }
 }
 
-async function main() {
-  while (true) {
-    const history  = loadHistory();
+// ─── Manual URL Analysis ──────────────────────────────────────────────────────
+
+const MANUAL_URL_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+function wasRecentlyAnalyzedByUrl(url: string): boolean {
+  try {
+    const entries = loadDetailedHistory();
+    const norm = url.toLowerCase().replace(/\/$/, '');
+    return entries.some(e =>
+      e.funnelUrl.toLowerCase().replace(/\/$/, '') === norm &&
+      e.origin === 'url_manual' &&
+      !!e.analyzedAt && (Date.now() - e.analyzedAt) < MANUAL_URL_TTL_MS
+    );
+  } catch { return false; }
+}
+
+async function analyzeUrlManual(targetUrl: string, force = false) {
+  if (!targetUrl.startsWith('http')) {
+    await sendToTelegram(`❌ URL inválido: <code>${targetUrl}</code>`);
+    return;
+  }
+
+  if (!force && wasRecentlyAnalyzedByUrl(targetUrl)) {
+    await sendToTelegram(
+      `⚠️ Este URL já foi analisado nos últimos 30 dias.\nUse <code>/analisar -f ${targetUrl}</code> para forçar nova análise.`
+    );
+    return;
+  }
+
+  await sendToTelegram(`🔍 <b>Analisando URL manual:</b>\n<code>${targetUrl}</code>`);
+
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath: process.env.REPLIT_PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+
+  try {
+    const context = await browser.newContext({
+      locale: 'pt-BR',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+      viewport: { width: 1920, height: 1080 },
+    });
+
+    const funnelStepData = await crawlFunnel(context, targetUrl);
+    await context.close();
+
+    if (funnelStepData.length === 0) {
+      await sendToTelegram(`⚠️ Não foi possível aceder à página: <code>${targetUrl}</code>`);
+      return;
+    }
+
+    const hasVSL      = funnelStepData.some((s: any) => s.type === 'VSL');
+    const hasQuiz     = funnelStepData.some((s: any) => s.isQuiz);
+    const hasUpsell   = funnelStepData.some((s: any) => s.hasUpsell);
+    const hasDownsell = funnelStepData.some((s: any) => s.hasDownsell);
+    const hasCheckout = funnelStepData.some((s: any) => s.hasCheckout);
+    const hasLongCopy = funnelStepData.some((s: any) => s.hasLongCopy);
+    const hasCTA      = funnelStepData.length > 0;
+
+    const score = calculateScore({ hasVSL, hasQuiz, hasUpsell, hasDownsell, funnelSteps: funnelStepData.length, hasCTA, hasCheckout, hasLongCopy });
+    const allFunnelText = funnelStepData.map((s: any) => s.rawText || '').join(' ');
+    const cleanCopy     = funnelStepData[0]?.copy || '';
+    const offerAnalysis = analyzeOffer(cleanCopy, allFunnelText);
+    const platform      = funnelStepData[0]?.platform || detectPlatform(targetUrl, allFunnelText);
+    const funnelType    = funnelStepData.map((s: any) => s.type).join(' → ');
+    const domains       = [...new Set(funnelStepData.map((s: any) => s.domain))] as string[];
+    const offerAngle    = detectOfferAngle(cleanCopy, allFunnelText);
+    const creativeStyle = detectCreativeStyle(hasVSL, 0, cleanCopy);
+    const rawOfferTitle = funnelStepData[0]?.offerTitle || '';
+    const offerTitle    = rawOfferTitle || offerAnalysis.product;
+    const priceNum      = extractPrice(allFunnelText);
+    const price         = priceNum ? `R$ ${priceNum.toFixed(2)} ✅` : '💡 Não identificado';
+    const mzTech        = MZ_TECH_PATTERNS.find(p => targetUrl.toLowerCase().includes(p) || allFunnelText.toLowerCase().includes(p)) || '';
+    const mzCheckout    = detectMzCheckout(targetUrl, allFunnelText);
+
+    const partial = { hasVSL, hasQuiz, hasUpsell, hasDownsell, funnelSteps: funnelStepData.length, domains, score, similarCount: 1, offerAnalysis };
+    const funnelComplexity      = detectFunnelComplexity(partial);
+    const performanceConfidence = detectPerformanceConfidence({ ...partial, funnelComplexity });
+
+    const ad: ScoredAd = {
+      advertiser: domains[0] || 'Manual',
+      keyword: 'URL Manual',
+      country: 'BR',
+      score, price, priceNum,
+      creativeType: hasVSL ? '🎥 Vídeo' : '🖼️ Imagem',
+      dateText: null,
+      hasVSL, hasQuiz, hasUpsell, hasDownsell, hasCheckout, hasLongCopy,
+      funnelSteps: funnelStepData.length,
+      funnelType, domains, platform,
+      funnelUrl: targetUrl,
+      landingDomain: domains[0] || '',
+      cleanCopy, creativePath: null, creativeIsVideo: false,
+      funnelStepData, offerAnalysis,
+      similarCount: 1, offerAngle, creativeStyle,
+      funnelComplexity, performanceConfidence,
+      recommendationLevel: computeRecommendationLevel({ funnelComplexity, performanceConfidence } as ScoredAd),
+      offerTitle,
+      mzTech, mzCheckout,
+    };
+
+    await sendAdReport(ad, 1, true);
+    appendDetailedHistory(ad, 'url_manual');
+    await sendToTelegram(`✅ <b>Análise manual concluída e guardada no histórico.</b>`);
+
+  } catch (err) {
+    console.error('[analyzeUrlManual] error:', err);
+    await sendToTelegram(`❌ <b>Erro ao analisar URL:</b> ${String(err).substring(0, 200)}`);
+  } finally {
+    await browser.close();
+  }
+}
+
+// ─── Telegram Command Handlers ────────────────────────────────────────────────
+
+function registerBotCommands() {
+  // /Iniciar_ — start the autonomous cycle
+  bot.onText(/\/Iniciar_/, async (tgMsg) => {
+    if (String(tgMsg.chat.id) !== CHAT_ID) return;
+    if (botRunning) {
+      await bot.sendMessage(CHAT_ID, '⚠️ O robô já está em execução.');
+      return;
+    }
+
+    // Plan today's categories and build full keyword list to show upfront
+    const p0 = planTodayCategories(loadProgress());
+    const isLast0 = isLastDayOfRotation(p0);
+    const kwLines: string[] = [];
+    for (const cat of p0.todayCategories) {
+      const kws = KEYWORD_CATEGORIES[cat] || [];
+      kwLines.push(`📂 <b>${cat}:</b>`);
+      kws.forEach(k => kwLines.push(`  • ${k}`));
+    }
+    if (isLast0) {
+      kwLines.push(`📂 <b>Black/PLR 🖤</b> (último dia da rotação):`);
+      (BLACK_PLR_CATEGORIES['BlackPLR'] || []).forEach(k => kwLines.push(`  • ${k}`));
+    }
+
+    await bot.sendMessage(CHAT_ID,
+      `🚀 <b>Robô iniciado!</b>\n\n` +
+      `📋 <b>Palavras-chave a analisar hoje:</b>\n${kwLines.join('\n')}\n\n` +
+      `⏱️ 15 min entre cada keyword. Iniciando agora...`,
+      { parse_mode: 'HTML' }
+    );
+
+    botRunning = true;
+    offersFoundToday = 0;
+    runMainLoop().catch(async (err) => {
+      console.error('[BOT] Main loop crashed:', err);
+      botRunning = false;
+      try { await sendToTelegram(`🚨 <b>Erro fatal no ciclo:</b> ${String(err).substring(0, 200)}`); } catch {}
+    });
+  });
+
+  // /status — current state
+  bot.onText(/\/status/, async (tgMsg) => {
+    if (String(tgMsg.chat.id) !== CHAT_ID) return;
+    let txt = botRunning ? '🟢 <b>Robô em execução</b>' : '🔴 <b>Robô parado</b> — use /Iniciar_ para começar';
+    if (currentKeyword) txt += `\n🔎 <b>Keyword atual:</b> ${currentKeyword}`;
+    txt += `\n📦 <b>Ofertas encontradas hoje:</b> ${offersFoundToday}`;
+    if (waitUntilMs) {
+      const remainingMs = Math.max(0, waitUntilMs - Date.now());
+      const h = Math.floor(remainingMs / 3600000);
+      const m = Math.floor((remainingMs % 3600000) / 60000);
+      txt += `\n⏰ <b>Próxima execução em:</b> ${h}h ${m}m`;
+    }
+    await bot.sendMessage(CHAT_ID, txt, { parse_mode: 'HTML' });
+  });
+
+  // /proxima — skip wait and advance to next keyword
+  bot.onText(/\/proxima/, async (tgMsg) => {
+    if (String(tgMsg.chat.id) !== CHAT_ID) return;
+    if (!botRunning) {
+      await bot.sendMessage(CHAT_ID, '⚠️ O robô não está em execução.');
+      return;
+    }
+    if (waitUntilMs) {
+      // Bot is in overnight sleep — /proxima can't help here, suggest /proximodia
+      await bot.sendMessage(CHAT_ID,
+        `⏰ O robô está em pausa até às 05:00 UTC.\nUse <code>/proximodia</code> para avançar para o próximo dia agora.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+    skipCurrentKeyword = true;
+    const next = nextKeywordHint ? `<b>${nextKeywordHint}</b>` : 'próxima palavra-chave';
+    await bot.sendMessage(CHAT_ID,
+      `⏭️ <b>A avançar para a próxima palavra-chave:</b> ${next}`,
+      { parse_mode: 'HTML' }
+    );
+  });
+
+  // /historico — show analysis history
+  bot.onText(/\/historico/, async (tgMsg) => {
+    if (String(tgMsg.chat.id) !== CHAT_ID) return;
+    const entries = loadDetailedHistory();
+    if (entries.length === 0) {
+      await bot.sendMessage(CHAT_ID, '📭 Nenhum histórico disponível ainda.');
+      return;
+    }
+
+    const last10 = entries.slice(-10).reverse();
+    const topByScore = [...entries].sort((a, b) => b.score - a.score).slice(0, 5);
+    const lastKeywords = [...new Set(entries.slice(-20).map(e => e.keyword))].slice(0, 8);
+
+    let histMsg = `📋 <b>HISTÓRICO DE ANÁLISES</b>\n`;
+    histMsg += `📦 Total de entradas: <b>${entries.length}</b>\n\n`;
+
+    histMsg += `🕐 <b>ÚLTIMAS ANÁLISES:</b>\n`;
+    for (const e of last10) {
+      histMsg += `• <b>${e.offerTitle.substring(0, 40)}</b>\n`;
+      histMsg += `  ${e.date} | ${e.keyword} | Score ${e.score}/10 | ${e.platform}\n`;
+      histMsg += `  ${e.funnelUrl !== 'N/A' ? e.funnelUrl.substring(0, 60) : 'N/A'}\n\n`;
+    }
+
+    histMsg += `\n🏆 <b>MELHORES SCORES:</b>\n`;
+    for (const e of topByScore) {
+      histMsg += `• <b>${e.offerTitle.substring(0, 40)}</b> — ${e.score}/10\n`;
+      histMsg += `  ${e.advertiser} | ${e.platform} | ${e.offerAngle}\n\n`;
+    }
+
+    histMsg += `\n🔑 <b>ÚLTIMAS KEYWORDS:</b>\n${lastKeywords.map(k => `• ${k}`).join('\n')}`;
+
+    // Send in chunks if too long
+    const chunks = histMsg.match(/.{1,4000}/gs) || [histMsg];
+    for (const chunk of chunks) {
+      await bot.sendMessage(CHAT_ID, chunk, { parse_mode: 'HTML', disable_web_page_preview: true });
+    }
+  });
+
+  // /analisar URL — manually analyze a specific funnel URL
+  bot.onText(/\/analisar (.+)/, async (analisarMsg, match) => {
+    if (String(analisarMsg.chat.id) !== CHAT_ID) return;
+    const arg = (match?.[1] || '').trim();
+    let force = false;
+    let url = arg;
+    if (arg.startsWith('-f ')) {
+      force = true;
+      url = arg.slice(3).trim();
+    }
+    analyzeUrlManual(url, force).catch(async (err) => {
+      console.error('[/analisar] error:', err);
+      try { await sendToTelegram(`❌ Erro inesperado: ${String(err).substring(0, 200)}`); } catch {}
+    });
+  });
+
+  // /resetarsemana — wipe ALL history and restart completely from zero
+  bot.onText(/\/resetarsemana/, async (resetMsg) => {
+    if (String(resetMsg.chat.id) !== CHAT_ID) return;
+    try {
+      let detailedCount = 0;
+      try { detailedCount = loadDetailedHistory().length; } catch {}
+
+      // Clear in-memory dedup history IMMEDIATELY (affects running cycle now)
+      globalHistory = {};
+
+      // Also wipe files so next restart also starts clean
+      if (fs.existsSync(HISTORY_FILE)) fs.unlinkSync(HISTORY_FILE);
+      if (fs.existsSync(DETAILED_HISTORY_FILE)) fs.unlinkSync(DETAILED_HISTORY_FILE);
+
+      // Reset today's metrics and progress (keep rotation index — don't lose place in rotation)
+      offersFoundToday = 0;
+      const p = loadProgress();
+      p.completedToday = [];
+      p.runDate = '';
+      saveProgress(p);
+
+      await bot.sendMessage(CHAT_ID,
+        `♻️ <b>Histórico completamente apagado!</b>\n\n` +
+        `• ✅ Memória em uso limpa imediatamente\n` +
+        `• ✅ Ficheiro de deduplicação apagado\n` +
+        `• ✅ ${detailedCount} análises detalhadas apagadas\n` +
+        `• ✅ Métricas do dia reiniciadas\n\n` +
+        `O robô já não se lembra de nenhum anúncio. A análise actual irá encontrar anúncios frescos.`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (err) {
+      await bot.sendMessage(CHAT_ID, `❌ Erro ao reiniciar: ${String(err).substring(0, 200)}`);
+    }
+  });
+
+  // /proximodia — force jump to next day's keywords immediately
+  bot.onText(/\/proximodia/, async (proximoDiaMsg) => {
+    if (String(proximoDiaMsg.chat.id) !== CHAT_ID) return;
+    const p = loadProgress();
+    const n = ALL_CATEGORY_NAMES.length;
+
+    // The nextCategoryIndex was already advanced by planTodayCategories for this day,
+    // so it already points to tomorrow's starting index
+    const nextCats = Array.from({ length: CATEGORIES_PER_DAY }, (_, i) =>
+      ALL_CATEGORY_NAMES[(p.nextCategoryIndex + i) % n]
+    );
+
+    // Build keyword preview for next day
+    const nextKwLines: string[] = [];
+    for (const cat of nextCats) {
+      const kws = KEYWORD_CATEGORIES[cat] || [];
+      nextKwLines.push(`📂 <b>${cat}:</b> ${kws.slice(0, 3).join(', ')}${kws.length > 3 ? ` +${kws.length - 3}` : ''}`);
+    }
+
+    // Mark current day as done and force re-plan
+    p.completedToday = [...p.todayCategories];
+    p.runDate = '';
+    saveProgress(p);
+
+    // Wake up from overnight wait and skip current keyword gap
+    skipWaitUntilNextRun = true;
+    skipCurrentKeyword = true;
+
+    await bot.sendMessage(CHAT_ID,
+      `⏭️ <b>A avançar para o próximo dia!</b>\n\n` +
+      `📋 <b>Palavras-chave do dia seguinte:</b>\n${nextKwLines.join('\n')}\n\n` +
+      `O ciclo recomeça em instantes...`,
+      { parse_mode: 'HTML' }
+    );
+  });
+
+  // /ajuda and /help — show all available commands
+  const helpText =
+`📖 <b>COMANDOS DISPONÍVEIS</b>
+
+/Iniciar_ — Inicia o robô e o ciclo autónomo de análise
+
+/status — Mostra o estado atual: keyword em curso, ofertas encontradas, tempo para próxima execução
+
+/proxima — Avança para a próxima keyword, ignorando a espera de 15 min
+
+/proximodia — Força a rotação para as keywords do próximo dia imediatamente
+
+/historico — Mostra o histórico de análises com produtos reais, scores, links e plataformas
+
+/analisar URL — Analisa um funil específico com o mesmo processo automático
+  Ex: <code>/analisar https://exemplo.com/funil</code>
+  Use <code>/analisar -f URL</code> para forçar re-análise (mesmo que já feita nos últimos 30 dias)
+
+/resetarsemana — Limpa o histórico dos últimos 7 dias e reinicia as métricas
+
+/ajuda ou /help — Mostra esta lista de comandos`;
+
+  bot.onText(/\/ajuda/, async (ajudaMsg) => {
+    if (String(ajudaMsg.chat.id) !== CHAT_ID) return;
+    await bot.sendMessage(CHAT_ID, helpText, { parse_mode: 'HTML', disable_web_page_preview: true });
+  });
+
+  bot.onText(/\/help/, async (helpMsg) => {
+    if (String(helpMsg.chat.id) !== CHAT_ID) return;
+    await bot.sendMessage(CHAT_ID, helpText, { parse_mode: 'HTML', disable_web_page_preview: true });
+  });
+
+  console.log('[BOT] Commands registered: /Iniciar_ /status /proxima /proximodia /historico /analisar /resetarsemana /ajuda /help');
+  console.log('[BOT] Polling active — listening for Telegram messages...');
+}
+
+// ─── Main loop (extracted so it can be called from /Iniciar_) ─────────────────
+
+async function runMainLoop() {
+  // Sync globalHistory from disk at loop start (respects 7-day auto-expire)
+  globalHistory = loadHistory();
+
+  while (botRunning) {
+    const history  = globalHistory;
     let   progress = loadProgress();
 
     progress = planTodayCategories(progress);
-    const todayCats  = progress.todayCategories;
-    const remaining  = todayCats.filter(c => !progress.completedToday.includes(c));
-    const historyAge = (() => {
+    const isLastDay     = isLastDayOfRotation(progress);
+    const todayCats     = progress.todayCategories;
+    const remaining     = todayCats.filter(c => !progress.completedToday.includes(c));
+    const historyAge    = (() => {
       try {
         const raw = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
         const age = Date.now() - (raw._meta?.createdAt ?? Date.now());
@@ -1287,36 +1944,50 @@ async function main() {
     console.log(`Categorias de hoje: ${todayCats.join(', ')}`);
     console.log(`Já concluídas hoje: ${progress.completedToday.join(', ') || 'nenhuma'}`);
     console.log(`Restam: ${remaining.join(', ') || 'nenhuma'}`);
+    if (isLastDay) console.log(`[LAST DAY] Black/PLR será executado após low-ticket`);
 
-    if (remaining.length === 0) {
+    if (remaining.length === 0 && !isLastDay) {
       await sendToTelegram(`✅ <b>Todas as categorias de hoje já foram analisadas.</b>\nAguardando próxima execução às 05:00 UTC.`);
       await waitUntilNextRun();
       continue;
     }
 
-    const catList = todayCats.map((c) => {
+    // Build today's run list: low-ticket remaining + Black/PLR if last day
+    const fullRunList = [...remaining];
+    if (isLastDay && !progress.completedToday.includes('BlackPLR')) {
+      fullRunList.push('BlackPLR');
+    }
+
+    if (fullRunList.length === 0) {
+      await waitUntilNextRun();
+      continue;
+    }
+
+    const allCatList = fullRunList.map((c) => {
       const done = progress.completedToday.includes(c);
-      const cur  = remaining[0] === c && !done;
-      return `${done ? '✅' : cur ? '▶️' : '⏳'} ${c}`;
+      const cur  = fullRunList[0] === c && !done;
+      const isBlack = !!BLACK_PLR_CATEGORIES[c];
+      return `${done ? '✅' : cur ? '▶️' : '⏳'} ${c}${isBlack ? ' 🖤' : ''}`;
     }).join('\n');
 
     await sendToTelegram(
-`🚀 <b>Agente v5 — Execução Diária</b>
+`🚀 <b>Agente v6 — Execução Diária</b>
 📅 <b>${progress.runDate}</b> | 05:00 UTC (07:00 Moçambique)
-🌍 Brasil 🇧🇷
+🌍 Brasil 🇧🇷 ${isLastDay ? '+ Moçambique 🇲🇿 (Black/PLR)' : ''}
 
-📂 <b>Categorias de hoje (${remaining.length} restante${remaining.length !== 1 ? 's' : ''}):</b>
-${catList}
+📂 <b>Categorias de hoje (${fullRunList.length} restante${fullRunList.length !== 1 ? 's' : ''}):</b>
+${allCatList}
 
 🔄 Rotação global: ${rotation} | 📋 Histórico: ${historyAge}
-⏱️ 15 min entre keywords | 🔁 Deduplificação ativa`
+⏱️ 15 min entre keywords | 🔁 Deduplificação ativa${isLastDay ? '\n🖤 Último dia da rotação — Black/PLR após low-ticket' : ''}`
     );
 
+    offersFoundToday = 0;
     const keywordScores = new Map<string, number[]>();
     const allAds: ScoredAd[] = [];
 
     try {
-      await runCycle(history, keywordScores, allAds, remaining, (completedCat) => {
+      await runCycle(history, keywordScores, allAds, fullRunList, (completedCat) => {
         progress.completedToday.push(completedCat);
         saveProgress(progress);
         console.log(`[PROGRESS] Category "${completedCat}" saved. Done today: ${progress.completedToday.join(', ')}`);
@@ -1326,11 +1997,15 @@ ${catList}
       if (allAds.length >= 3)    await sendCompetitiveGapAnalysis(allAds);
       saveHistory(history);
 
+      const nextCats = Array.from({ length: CATEGORIES_PER_DAY }, (_, i) =>
+        ALL_CATEGORY_NAMES[(progress.nextCategoryIndex + i) % ALL_CATEGORY_NAMES.length]
+      ).join(', ');
+
       await sendToTelegram(
 `✅ <b>Análise do dia ${progress.runDate} concluída!</b>
-📂 Categorias: ${todayCats.join(', ')}
+📂 Categorias: ${todayCats.join(', ')}${isLastDay ? ' + Black/PLR 🖤' : ''}
 📊 ${allAds.length} anúncio${allAds.length !== 1 ? 's' : ''} analisado${allAds.length !== 1 ? 's' : ''}
-🔄 Próximas categorias: ${Array.from({ length: CATEGORIES_PER_DAY }, (_, i) => ALL_CATEGORY_NAMES[(progress.nextCategoryIndex + i) % ALL_CATEGORY_NAMES.length]).join(', ')}`
+🔄 Próximas categorias: ${nextCats}`
       );
 
     } catch (err) {
@@ -1341,11 +2016,21 @@ ${catList}
 
     await waitUntilNextRun();
   }
+
+  botRunning = false;
 }
 
-main().catch(async (err) => {
+// ─── Entry Point ──────────────────────────────────────────────────────────────
+
+registerBotCommands();
+
+// Auto-start the main loop on process start (same behaviour as before)
+botRunning = true;
+runMainLoop().catch(async (err) => {
   console.error('Fatal error:', err);
+  botRunning = false;
   try { await sendToTelegram(`🚨 <b>Erro fatal — reiniciando em 2 min:</b> ${String(err).substring(0, 200)}`); } catch {}
   await delay(2 * 60 * 1000);
-  main().catch(console.error);
+  botRunning = true;
+  runMainLoop().catch(console.error);
 });
