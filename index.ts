@@ -951,6 +951,7 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
 function deduplicateRawCards(rawCards: any[]): any[] {
   const seen = new Map<string, { card: any; count: number }>();
   for (const card of rawCards) {
+    if (!card || typeof card !== 'object') continue;
     const funnelUrl = (card.ctaLinks?.[0] || card.links?.[0] || '').toLowerCase();
     let landingDomain = '';
     try { landingDomain = new URL(funnelUrl).hostname; } catch {}
@@ -1230,7 +1231,7 @@ async function scrapeKeyword(
 
         const raw = await card.evaluate(BROWSER_CARD_JS);
 
-        rawCards.push(raw);
+        if (raw && typeof raw === 'object') rawCards.push(raw);
       } catch (err) { console.error(`Card ${i} read error:`, err); }
     }
 
