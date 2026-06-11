@@ -925,7 +925,8 @@ async function crawlFunnel(context: BrowserContext, startUrl: string): Promise<a
       const screenshotPath = `funnel_${domain.replace(/[^a-z0-9]/gi, '_')}_${Date.now()}_${depth + 1}.png`;
       await page.screenshot({ path: screenshotPath, fullPage: true });
 
-      const pageData = await page.evaluate(BROWSER_PAGE_JS);
+      await page.evaluate('window.__pageExtract = ' + BROWSER_PAGE_JS);
+      const pageData = await page.evaluate(() => (window as any).__pageExtract());
 
       const pageType = classifyPage(pageData.rawText, pageData.hasVideo, pageData.radioInputs, realUrl);
       const cleanCopy = extractSalesCopy(pageData.rawText);
@@ -1196,6 +1197,8 @@ async function scrapeKeyword(
     await sendToTelegram(`🔎 <b>PESQUISANDO:</b> ${keyword} — ${countryName}`);
     await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await delay(4000);
+    // Inject card extractor as a window function (bypasses esbuild __name injection)
+    await page.evaluate('window.__cardExtract = ' + BROWSER_CARD_JS);
     await page.evaluate(() => window.scrollBy(0, 800));
     await delay(3000);
 
@@ -1229,7 +1232,7 @@ async function scrapeKeyword(
         const sponsored = sponsoredLocator.nth(i);
         const card = sponsored.locator('xpath=ancestor::div[.//a[@role="link"]][1]');
 
-        const raw = await card.evaluate(BROWSER_CARD_JS);
+        const raw = await card.evaluate(el => (window as any).__cardExtract(el));
 
         if (raw && typeof raw === 'object') rawCards.push(raw);
       } catch (err) { console.error(`Card ${i} read error:`, err); }
