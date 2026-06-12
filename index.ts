@@ -40,23 +40,59 @@ const BROWSER_CARD_JS = `(el) => {
     if (href.indexOf('http') === 0 && !blocked.some(function(d){ return href.indexOf(d) !== -1; })) return href;
     return null;
   };
-  var ctaBtns = ['saiba mais','comprar','baixe','quero','acessar','garantir','clique','ver mais','obter','assinar','inscrever','comecar'];
+  var ctaBtns = ['saiba mais','comprar','baixe','quero','acessar','garantir','clique','ver mais','obter','assinar','inscrever','comecar','curtir pagina','seguir','enviar mensagem','ligar agora'];
+  // ── Improved advertiser extraction ──────────────────────────────────────────
+  // Strategy: scan a[role="link"] elements in order; the page name is the first
+  // one that (a) has readable text, (b) is short, (c) is not a CTA, and
+  // (d) appears before "Patrocinado" text in the card's flat text.
+  var advertiser = 'Desconhecido';
+  var fullCardText = el.innerText || '';
+  var patronBefore = fullCardText.toLowerCase().indexOf('patrocinado');
   var allRoleLinks = Array.from(el.querySelectorAll('a[role="link"]'));
-  var advertiserEl = allRoleLinks.find(function(a) {
-    var t = (a.innerText || '').toLowerCase().trim();
-    return t.length > 0 && t.length < 60 && !ctaBtns.some(function(k){ return t.indexOf(k) !== -1; });
-  }) || null;
-  var advertiser = advertiserEl ? (advertiserEl.innerText || '').trim() : 'Desconhecido';
+  for (var _i = 0; _i < allRoleLinks.length; _i++) {
+    var _a = allRoleLinks[_i];
+    var _t = (_a.innerText || _a.textContent || '').replace(/\\s+/g,' ').trim();
+    if (_t.length < 2 || _t.length > 80) continue;
+    var _tl = _t.toLowerCase();
+    if (ctaBtns.some(function(k){ return _tl.indexOf(k) !== -1; })) continue;
+    if (_tl.indexOf('patrocinado') !== -1 || _tl.indexOf('sponsored') !== -1) continue;
+    if (_tl.indexOf('http') !== -1) continue;
+    // Prefer links that appear before the "Patrocinado" marker
+    if (patronBefore > 0) {
+      try {
+        var elRect = _a.getBoundingClientRect();
+        var cardRect = el.getBoundingClientRect();
+        if (elRect.top - cardRect.top > 120) continue; // skip links far below top
+      } catch(e) {}
+    }
+    advertiser = _t;
+    break;
+  }
+  // Fallback: first strong/b/heading element that looks like a name
+  if (advertiser === 'Desconhecido') {
+    var nameEl = el.querySelector('strong, b, [role="heading"]');
+    if (nameEl) {
+      var nt = (nameEl.innerText || '').replace(/\\s+/g,' ').trim();
+      if (nt.length > 2 && nt.length < 80) advertiser = nt;
+    }
+  }
+  // ── Text (exclude advertiser node) ──────────────────────────────────────────
   var text = '';
   el.childNodes.forEach(function(node) {
-    if (node !== advertiserEl && !(node.contains && node.contains(advertiserEl))) {
-      text += node.innerText || node.textContent || '';
-    }
+    var nodeText = node.innerText || node.textContent || '';
+    if (advertiser !== 'Desconhecido' && nodeText.indexOf(advertiser) === 0) return;
+    text += nodeText;
   });
   if (!text.trim()) {
-    text = el.innerText || '';
-    if (advertiser && text.indexOf(advertiser) === 0) text = text.slice(advertiser.length);
+    text = fullCardText;
+    if (advertiser !== 'Desconhecido' && text.indexOf(advertiser) === 0) text = text.slice(advertiser.length);
   }
+  // ── Duration: "Ativo desde" / "Iniciou a veiculação" ────────────────────────
+  var activeMatch = fullCardText.match(/ativo desde[^\\n|]{4,40}/i) ||
+                    fullCardText.match(/iniciou a veicula[^\\n|]{4,50}/i) ||
+                    fullCardText.match(/a partir de[^\\n|]{4,30}/i);
+  var activeSince = activeMatch ? activeMatch[0].replace(/\\s+/g,' ').trim() : null;
+  // ── Creatives ────────────────────────────────────────────────────────────────
   var images = [];
   el.querySelectorAll('img').forEach(function(img) {
     var src = img.getAttribute('src') || img.getAttribute('data-src') || '';
@@ -72,14 +108,16 @@ const BROWSER_CARD_JS = `(el) => {
     var m = (node.style.backgroundImage || '').match(/url\\(["']?(https?[^"')]+)["']?\\)/);
     if (m && m[1]) bgImages.push(m[1]);
   });
-  var videos = Array.from(el.querySelectorAll('video')).map(function(v){ return v.src; }).filter(Boolean);
+  var videos = Array.from(el.querySelectorAll('video')).map(function(v){ return v.src || v.currentSrc || ''; }).filter(Boolean);
+  // Also grab video sources from <source> tags
+  Array.from(el.querySelectorAll('video source')).forEach(function(s){ var u = s.getAttribute('src'); if(u) videos.push(u); });
   var ctaKeys = ['saiba mais','comprar','baixe','quero','acessar','garantir','clique','continuar','comecar','ver mais','obter','inscrever','assinar'];
   var ctaLinks = Array.from(el.querySelectorAll('a')).filter(function(a){ var t=(a.innerText||'').toLowerCase(); return ctaKeys.some(function(k){ return t.indexOf(k)!==-1; }); }).map(function(a){ return realUrl(a.href); }).filter(function(h){ return h !== null; });
   var allLinks = Array.from(el.querySelectorAll('a')).map(function(a){ return realUrl(a.href); }).filter(function(h){ return h !== null; });
   var waLinks = Array.from(el.querySelectorAll('a')).map(function(a){ return a.href; }).filter(function(h){ return h && (h.indexOf('wa.me') !== -1 || h.indexOf('whatsapp.com/send') !== -1); });
   var dateMatch = text.match(/(\\d+)\\s*de\\s*(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)/i);
   var uniqImages = images.filter(function(v,i,a){ return a.indexOf(v)===i; }).slice(0,3);
-  return { text: text.substring(0,1000), images: uniqImages, backgroundImages: bgImages.slice(0,2), videos: videos.slice(0,2), hasVideo: videos.length > 0, advertiser: advertiser, dateText: dateMatch ? dateMatch[0] : null, ctaLinks: ctaLinks.slice(0,3), links: allLinks.slice(0,3), waLinks: waLinks.slice(0,2) };
+  return { text: text.substring(0,1000), images: uniqImages, backgroundImages: bgImages.slice(0,2), videos: videos.slice(0,2), hasVideo: videos.length > 0, advertiser: advertiser, dateText: dateMatch ? dateMatch[0] : null, activeSince: activeSince, ctaLinks: ctaLinks.slice(0,3), links: allLinks.slice(0,3), waLinks: waLinks.slice(0,2) };
 }`;
 
 const BROWSER_PAGE_JS = `() => {
@@ -169,8 +207,28 @@ const FUNNEL_DOMAIN_BLACKLIST = [
 ];
 
 // Mozambique: just detect tech + checkout presence, no price filter
-const MZ_TECH_PATTERNS  = ['lovable', 'vercel', 'bolt.new', 'bolt.diy'];
-const MZ_CHECKOUT_PATTERNS = ['escalepay', 'escale.pay', 'ratixpay', 'ratix.pay', 'lojou', 'kambafy', 'zenofy'];
+const MZ_TECH_PATTERNS  = ['lovable', 'vercel', 'bolt.new', 'bolt.diy', 'bolt', 'vercel.app'];
+const MZ_CHECKOUT_PATTERNS = ['escalepay', 'escale.pay', 'escale pay', 'ratixpay', 'ratix.pay', 'ratix pay', 'lojou', 'kambafy', 'zenofy'];
+
+// Mozambique niche keywords (runs on MZ country during Black/PLR day)
+const MZ_NICHE_CATEGORIES: Record<string, string[]> = {
+  'MZ-Emagrecimento': [
+    'emagrecer mocambique', 'perder peso rapido', 'dieta detox', 'queimar gordura',
+    'emagrecimento definitivo',
+  ],
+  'MZ-Relacionamento': [
+    'reconquistar ex', 'relacionamento amoroso', 'como seduzir', 'segredos do amor',
+    'homem perfeito',
+  ],
+  'MZ-RendaExtra': [
+    'renda extra online', 'ganhar dinheiro internet', 'trabalhar em casa',
+    'como ganhar dinheiro', 'renda passiva',
+  ],
+  'MZ-Saude': [
+    'aumentar imunidade', 'remedios naturais', 'saude hormonal', 'pressao alta natural',
+    'diabetes naturalmente',
+  ],
+};
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -183,6 +241,7 @@ interface ScoredAd {
   priceNum: number | null;
   creativeType: string;
   dateText: string | null;
+  activeSince: string | null;
   hasVSL: boolean;
   hasQuiz: boolean;
   hasUpsell: boolean;
@@ -495,9 +554,14 @@ function downloadFile(url: string, dest: string, minBytes = 0, depth = 0): Promi
     const protocol = url.startsWith('https') ? https : http;
     const options = {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Referer': 'https://www.facebook.com/',
-        'Accept': '*/*',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Sec-Fetch-Dest': 'image',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'cross-site',
       }
     };
     const req = protocol.get(url, options, (res) => {
@@ -1066,6 +1130,7 @@ async function collectAd(
       priceNum,
       creativeType: rawCard.hasVideo ? '🎥 Vídeo' : '🖼️ Imagem',
       dateText: rawCard.dateText,
+      activeSince: rawCard.activeSince ?? null,
       hasVSL, hasQuiz, hasUpsell, hasDownsell, hasCheckout, hasLongCopy,
       funnelSteps: funnelStepData.length,
       funnelType,
@@ -1122,7 +1187,7 @@ async function sendAdReport(ad: ScoredAd, rank: number, isBest: boolean) {
 📦 <b>Produto:</b> ${ad.offerTitle}
 🛠️ <b>Tecnologia detectada:</b> ${ad.mzTech || 'Não identificada'}
 🛒 <b>Checkout detectado:</b> ${ad.mzCheckout || 'Não identificado'}
-🏪 <b>Plataforma:</b> ${ad.platform}
+🏪 <b>Plataforma:</b> ${ad.platform}${ad.activeSince ? `\n⏱️ <b>Tempo no ar:</b> ${ad.activeSince}` : ''}
 🔗 <b>Funil:</b> ${ad.funnelUrl}`);
     return;
   }
@@ -1136,7 +1201,7 @@ async function sendAdReport(ad: ScoredAd, rank: number, isBest: boolean) {
 💰 <b>Preço:</b> ${ad.price}
 🎨 <b>Criativo:</b> ${ad.creativeType} — ${ad.creativeStyle}
 🏪 <b>Plataforma:</b> ${ad.platform}
-📅 <b>Data início:</b> ${ad.dateText || 'Desconhecida'}
+📅 <b>Data início:</b> ${ad.dateText || 'Desconhecida'}${ad.activeSince ? `\n⏱️ <b>Tempo no ar:</b> ${ad.activeSince}` : ''}
 
 🎭 <b>Ângulo da oferta:</b> ${ad.offerAngle}
 💡 <b>Promessa:</b> ${offer.mainPromise}
@@ -1531,6 +1596,228 @@ async function runCycle(
 
       onCategoryComplete?.(category);
     }
+
+    // ── Mozambique niche searches (run alongside BlackPLR or last day) ──────────
+    const mzNicheNames = Object.keys(MZ_NICHE_CATEGORIES);
+    if (categoriesToRun.includes('BlackPLR') || mzNicheNames.some(n => categoriesToRun.includes(n))) {
+      for (const mzCat of mzNicheNames) {
+        const mzKeywords = MZ_NICHE_CATEGORIES[mzCat];
+        await sendToTelegram(`\n🗺️ <b>NICHO MZ: ${mzCat}</b> | Moçambique 🇲🇿`);
+        const mzContext = await browser.newContext({
+          locale: 'pt-MZ',
+          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+          viewport: { width: 1920, height: 1080 },
+        });
+        const mzPage = await mzContext.newPage();
+        for (let kwIdx = 0; kwIdx < mzKeywords.length; kwIdx++) {
+          const kw = mzKeywords[kwIdx];
+          nextKeywordHint = mzKeywords[kwIdx + 1] ?? null;
+          const kwAds = await scrapeKeyword(kw, MZ_COUNTRY, mzContext, mzPage, history, keywordScores);
+          allAds.push(...kwAds);
+          if (skipCurrentKeyword) { skipCurrentKeyword = false; continue; }
+          if (kwIdx < mzKeywords.length - 1) {
+            await sendToTelegram(`⏱️ Aguardando 15 min antes da próxima keyword MZ: <b>${mzKeywords[kwIdx + 1]}</b>`);
+            const gapEnd = Date.now() + KEYWORD_GAP_MS;
+            while (Date.now() < gapEnd) {
+              if (skipCurrentKeyword) { skipCurrentKeyword = false; break; }
+              await delay(5000);
+            }
+          }
+        }
+        nextKeywordHint = null;
+        await mzContext.close();
+      }
+    }
+  } finally {
+    await browser.close();
+  }
+}
+
+// ─── Single-keyword quick analysis (for /testar command) ─────────────────────
+
+async function runSingleKeywordAnalysis(keyword: string) {
+  await sendToTelegram(`🔍 <b>/testar</b> iniciado para: <b>${keyword}</b>\nAbrindo browser...`);
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath: process.env.REPLIT_PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+  try {
+    const context = await browser.newContext({
+      locale: 'pt-BR',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+      viewport: { width: 1920, height: 1080 },
+    });
+    const page = await context.newPage();
+    const histSnap = loadHistory();
+    const kwScores = new Map<string, number[]>();
+    const ads = await scrapeKeyword(keyword, 'BR', context, page, histSnap, kwScores);
+    await context.close();
+    if (ads.length === 0) {
+      await sendToTelegram(`🔍 <b>/testar:</b> nenhuma oferta encontrada para <b>${keyword}</b>`);
+    } else {
+      await sendToTelegram(`🔍 <b>/testar:</b> ${ads.length} oferta(s) encontrada(s) para <b>${keyword}</b>`);
+      const sorted = [...ads].sort((a, b) => b.score - a.score);
+      for (let i = 0; i < sorted.length; i++) {
+        await sendAdReport(sorted[i], i + 1, i === 0);
+      }
+    }
+  } catch (err) {
+    console.error('[/testar] error:', err);
+    await sendToTelegram(`❌ <b>/testar</b> erro: ${String(err).substring(0, 200)}`);
+  } finally {
+    await browser.close();
+  }
+}
+
+// ─── URLScan.io offer hunting (only on explicit /urlscan command) ──────────────
+
+function fetchJsonHttps(url: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': 'application/json',
+      }
+    };
+    https.get(url, opts, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(body)); } catch(e) { reject(e); }
+      });
+    }).on('error', reject).setTimeout(15000, function() { this.destroy(new Error('timeout')); });
+  });
+}
+
+async function runUrlScanSearch() {
+  await sendToTelegram(`🌐 <b>URLScan — iniciando pesquisa de ofertas...</b>\nBuscando páginas com converteai.net e utmify.com.br`);
+
+  const queries = [
+    'page.domain:converteai.net',
+    'page.url:utmify.com.br',
+  ];
+
+  const collectedUrls: string[] = [];
+  for (const q of queries) {
+    try {
+      const apiUrl = `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(q)}&size=50`;
+      const data = await fetchJsonHttps(apiUrl);
+      const results: any[] = data.results || [];
+      for (const r of results) {
+        const u: string = r.page?.url || r.task?.url || '';
+        if (u && u.startsWith('http') && !collectedUrls.includes(u)) {
+          collectedUrls.push(u);
+        }
+      }
+      console.log(`[URLScan] ${q} → ${results.length} results`);
+    } catch (err) {
+      console.error('[URLScan] query error:', err);
+    }
+  }
+
+  if (collectedUrls.length === 0) {
+    await sendToTelegram(`🌐 <b>URLScan:</b> nenhuma URL encontrada.`);
+    return;
+  }
+
+  await sendToTelegram(`🌐 <b>URLScan:</b> ${collectedUrls.length} URLs encontradas. Analisando funnels...`);
+
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath: process.env.REPLIT_PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+  try {
+    const context = await browser.newContext({
+      locale: 'pt-BR',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+      viewport: { width: 1920, height: 1080 },
+    });
+
+    let analyzed = 0;
+    let rank = 0;
+    const histSnap = loadHistory();
+
+    for (const url of collectedUrls.slice(0, 30)) {
+      try {
+        if (isDomainBlacklisted(url)) continue;
+
+        const normalizedUrl = normalizeUrlForDedup(url);
+        const histKey = normalizedUrl || url.toLowerCase().substring(0, 150);
+        if (wasRecentlyAnalyzed(histSnap, histKey)) {
+          console.log(`[URLScan] skip dedup: ${url}`);
+          continue;
+        }
+
+        console.log(`[URLScan] crawling: ${url}`);
+        const funnelStepData = await crawlFunnel(context, url);
+        if (funnelStepData.length === 0) continue;
+
+        const allFunnelText = funnelStepData.map((s: any) => s.rawText || '').join(' ');
+        const hasVSL       = funnelStepData.some((s: any) => s.type === 'VSL');
+        const hasQuiz      = funnelStepData.some((s: any) => s.isQuiz);
+        const hasUpsell    = funnelStepData.some((s: any) => s.hasUpsell);
+        const hasDownsell  = funnelStepData.some((s: any) => s.hasDownsell);
+        const hasCheckout  = funnelStepData.some((s: any) => s.hasCheckout);
+        const hasLongCopy  = funnelStepData.some((s: any) => s.hasLongCopy);
+
+        const score      = calculateScore({ hasVSL, hasQuiz, hasUpsell, hasDownsell, funnelSteps: funnelStepData.length, hasCTA: true, hasCheckout, hasLongCopy });
+        const domains    = [...new Set(funnelStepData.map((s: any) => s.domain))] as string[];
+        const platform   = funnelStepData[0]?.platform || 'Direto';
+        const funnelType = funnelStepData.map((s: any) => s.type).join(' → ');
+        const cleanCopy  = extractSalesCopy(allFunnelText);
+        const offerAnalysis = analyzeOffer(cleanCopy, allFunnelText);
+        const offerAngle = detectOfferAngle(cleanCopy, allFunnelText);
+        const rawOfferTitle = funnelStepData[0]?.offerTitle || '';
+        const offerTitle = rawOfferTitle && rawOfferTitle !== 'Título não encontrado' ? rawOfferTitle : (offerAnalysis.product || 'Título não encontrado');
+        const priceNum   = extractPrice(allFunnelText);
+        const price      = priceNum ? `R$ ${priceNum.toFixed(2)} ✅` : '💡 Não identificado';
+        const mzTech     = MZ_TECH_PATTERNS.find(p => (funnelStepData.map((s: any) => s.technology || '').join(' ') + url).toLowerCase().includes(p)) || '';
+        const mzCheckout = detectMzCheckout(url, allFunnelText);
+        const partial    = { hasVSL, hasQuiz, hasUpsell, hasDownsell, funnelSteps: funnelStepData.length, domains, score, similarCount: 1, offerAnalysis };
+        const funnelComplexity      = detectFunnelComplexity(partial);
+        const performanceConfidence = detectPerformanceConfidence({ ...partial, funnelComplexity });
+        const creativeStyle = detectCreativeStyle(hasVSL, 0, allFunnelText);
+
+        markAnalyzed(histSnap, histKey, score, 'URLScan');
+
+        const urlAd: ScoredAd = {
+          advertiser: domains[0] || 'URLScan',
+          keyword: 'URLScan',
+          country: 'BR',
+          score, price, priceNum,
+          creativeType: hasVSL ? '🎥 Vídeo' : '🖼️ Imagem',
+          dateText: null,
+          activeSince: null,
+          hasVSL, hasQuiz, hasUpsell, hasDownsell, hasCheckout, hasLongCopy,
+          funnelSteps: funnelStepData.length,
+          funnelType, domains, platform,
+          funnelUrl: url,
+          landingDomain: domains[0] || '',
+          cleanCopy,
+          creativePath: null,
+          creativeIsVideo: false,
+          funnelStepData,
+          offerAnalysis, similarCount: 1, offerAngle, creativeStyle,
+          funnelComplexity, performanceConfidence,
+          offerTitle,
+          recommendationLevel: computeRecommendationLevel({ hasVSL, hasQuiz, hasUpsell, hasDownsell, funnelSteps: funnelStepData.length, funnelType, domains, score, price, priceNum, creativeType: hasVSL ? '🎥 Vídeo' : '🖼️ Imagem', dateText: null, activeSince: null, hasCheckout, hasLongCopy, platform, funnelUrl: url, landingDomain: domains[0] || '', cleanCopy, creativePath: null, creativeIsVideo: false, funnelStepData, offerAnalysis, similarCount: 1, offerAngle, creativeStyle, funnelComplexity, performanceConfidence, offerTitle, isMozambique: false, mzTech, mzCheckout, keyword: 'URLScan', country: 'BR', advertiser: domains[0] || 'URLScan', recommendationLevel: '' } as ScoredAd),
+          isMozambique: false, mzTech, mzCheckout,
+        };
+
+        rank++;
+        analyzed++;
+        await sendAdReport(urlAd, rank, rank === 1);
+        appendDetailedHistory(urlAd);
+      } catch (err) {
+        console.error(`[URLScan] failed for ${url}:`, err);
+      }
+    }
+
+    await context.close();
+    saveHistory(histSnap);
+    await sendToTelegram(`✅ <b>URLScan concluído:</b> ${analyzed} oferta(s) analisada(s) de ${Math.min(collectedUrls.length, 30)} URLs.`);
   } finally {
     await browser.close();
   }
@@ -1623,6 +1910,7 @@ async function analyzeUrlManual(targetUrl: string, force = false) {
       score, price, priceNum,
       creativeType: hasVSL ? '🎥 Vídeo' : '🖼️ Imagem',
       dateText: null,
+      activeSince: null,
       hasVSL, hasQuiz, hasUpsell, hasDownsell, hasCheckout, hasLongCopy,
       funnelSteps: funnelStepData.length,
       funnelType, domains, platform,
@@ -1853,6 +2141,31 @@ function registerBotCommands() {
     );
   });
 
+  // /testar KEYWORD — run a single keyword immediately (independent of main loop)
+  bot.onText(/\/testar (.+)/, async (testarMsg, match) => {
+    if (String(testarMsg.chat.id) !== CHAT_ID) return;
+    const keyword = (match?.[1] || '').trim();
+    if (!keyword) {
+      await bot.sendMessage(CHAT_ID, '⚠️ Usa: <code>/testar sua palavra-chave</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    runSingleKeywordAnalysis(keyword).catch(async (err) => {
+      await sendToTelegram(`❌ <b>/testar</b> erro inesperado: ${String(err).substring(0, 200)}`);
+    });
+  });
+
+  // /urlscan — search URLScan.io for converteai.net and utmify.com.br offers
+  bot.onText(/\/urlscan/, async (urlscanMsg) => {
+    if (String(urlscanMsg.chat.id) !== CHAT_ID) return;
+    await bot.sendMessage(CHAT_ID,
+      `🌐 <b>URLScan iniciado.</b>\nVou procurar ofertas via converteai.net e utmify.com.br e analisar cada página encontrada.\nIsso pode demorar alguns minutos...`,
+      { parse_mode: 'HTML' }
+    );
+    runUrlScanSearch().catch(async (err) => {
+      await sendToTelegram(`❌ <b>/urlscan</b> erro: ${String(err).substring(0, 200)}`);
+    });
+  });
+
   // /ajuda and /help — show all available commands
   const helpText =
 `📖 <b>COMANDOS DISPONÍVEIS</b>
@@ -1867,9 +2180,14 @@ function registerBotCommands() {
 
 /historico — Mostra o histórico de análises com produtos reais, scores, links e plataformas
 
+/testar KEYWORD — Pesquisa uma keyword imediatamente, sem esperar a rotação
+  Ex: <code>/testar emagrecer rapido</code>
+
 /analisar URL — Analisa um funil específico com o mesmo processo automático
   Ex: <code>/analisar https://exemplo.com/funil</code>
   Use <code>/analisar -f URL</code> para forçar re-análise (mesmo que já feita nos últimos 30 dias)
+
+/urlscan — Pesquisa ofertas via URLScan.io (converteai.net + utmify.com.br), analisa todas as páginas encontradas e envia relatório. Só executa quando chamado manualmente.
 
 /resetarsemana — Limpa o histórico dos últimos 7 dias e reinicia as métricas
 
@@ -1885,7 +2203,7 @@ function registerBotCommands() {
     await bot.sendMessage(CHAT_ID, helpText, { parse_mode: 'HTML', disable_web_page_preview: true });
   });
 
-  console.log('[BOT] Commands registered: /Iniciar_ /status /proxima /proximodia /historico /analisar /resetarsemana /ajuda /help');
+  console.log('[BOT] Commands registered: /Iniciar_ /status /proxima /proximodia /historico /testar /analisar /urlscan /resetarsemana /ajuda /help');
   console.log('[BOT] Polling active — listening for Telegram messages...');
 }
 
